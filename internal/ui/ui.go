@@ -35,7 +35,10 @@ import (
 	"sync"
 	"time"
 
+	"remote.network/client/internal/agent"
 	"remote.network/client/internal/config"
+	"remote.network/client/internal/permissions"
+	"remote.network/client/internal/tools"
 )
 
 // Config builds the UI handler.
@@ -58,6 +61,16 @@ type Config struct {
 	// OnKey, when set, hands a replaced key to the running proxy so it is
 	// used at once (no restart).
 	OnKey func(key string)
+	// Loop drives the local tool turns for POST /ui/api/chat (nil = tools
+	// off: the page sends its turns to /v1/chat/completions itself).
+	Loop *agent.Loop
+	// Reg is the MCP registry behind the settings page's tools list.
+	Reg *tools.Registry
+	// Perms is the permission store behind the tools list's modes.
+	Perms *permissions.Store
+	// ToolsOn says whether turns should run through the tool loop (the
+	// resolved tools setting AND at least one configured server).
+	ToolsOn func() bool
 }
 
 // Handler serves /ui/ (the SPA) and /ui/api/* (the JSON API).
@@ -68,6 +81,13 @@ type Handler struct {
 	mu     sync.Mutex
 	index  []byte // index.html with the token injected ("" = not built yet)
 	loaded bool
+
+	// asksMu guards asks: the pending permission prompts (ask id → the
+	// ask's channel and the tool name its "always" persists under).
+	// Registered by the chat turn's asker, answered by
+	// POST /ui/api/tools/decide.
+	asksMu sync.Mutex
+	asks   map[string]*pendingAsk
 }
 
 // New builds the handler, generating the per-process CSRF token when the
@@ -77,7 +97,7 @@ func New(cfg Config) *Handler {
 	if token == "" {
 		token = randomToken()
 	}
-	return &Handler{cfg: cfg, token: token, dist: cfg.Dist}
+	return &Handler{cfg: cfg, token: token, dist: cfg.Dist, asks: map[string]*pendingAsk{}}
 }
 
 // Token is the process's CSRF token (tests use it to authenticate).
@@ -225,6 +245,14 @@ func (h *Handler) api(w http.ResponseWriter, r *http.Request) {
 		h.login(w, r)
 	case rest == "/doctor" && r.Method == http.MethodPost:
 		h.doctor(w, r)
+	case rest == "/tools" && r.Method == http.MethodGet:
+		h.listTools(w, r)
+	case rest == "/tools/mode" && r.Method == http.MethodPost:
+		h.setToolMode(w, r)
+	case rest == "/tools/decide" && r.Method == http.MethodPost:
+		h.decide(w, r)
+	case rest == "/chat" && r.Method == http.MethodPost:
+		h.chat(w, r)
 	default:
 		h.writeError(w, http.StatusNotFound, "not_found", "no such UI API surface")
 	}
@@ -262,7 +290,7 @@ func (h *Handler) getSettings(w http.ResponseWriter) {
 		h.writeError(w, http.StatusInternalServerError, "settings", err.Error())
 		return
 	}
-	h.writeJSON(w, map[string]any{"settings": h.views(s)})
+	h.writeJSON(w, map[string]any{"settings": h.views(s), "tools_enabled": h.toolsOn()})
 }
 
 // settingRow is one row of the settings page.
@@ -328,7 +356,17 @@ func (h *Handler) views(s config.Settings) []settingRow {
 		boolRow("ui", "web UI", s.UI.Value, s.UI.Source, "this page; takes effect on restart"),
 		strRow("default_model", "default model", s.DefaultModel.Value, s.DefaultModel.Set(), s.DefaultModel.Source, "the model chat starts with"),
 		boolRow("web_search", "web search", s.WebSearch.Value, s.WebSearch.Source, "the default for this client's own chat surfaces; the search runs on the router"),
-		strRow("mcp_config", "MCP config", s.MCPConfig.Value, true, s.MCPConfig.Source, "local tool servers (the tools phase wires them up)"),
+		// Read-only in the UI, always (the review rule): this file names
+		// commands the client runs, so a page that could repoint it could
+		// run any command without a permission prompt. Servers are added
+		// by editing the file, or with `config set` from a terminal.
+		settingRow{
+			Key: "mcp_config", Label: "MCP config", Value: s.MCPConfig.Value, Set: true,
+			Source: s.MCPConfig.Source.Kind, SourceName: s.MCPConfig.Source.Name,
+			Locked:     true,
+			LockReason: "read-only here — change it by editing the file or with `config set`; the file names commands this machine runs, so the browser must never repoint it",
+			Kind:       "string", Note: "the local tools' server list (stdio MCP servers)",
+		},
 		boolRow("tools", "local tools", s.Tools.Value, s.Tools.Source, "the local tool loop for the client's own chat surfaces; on by default when an MCP config exists"),
 	}
 	return rows

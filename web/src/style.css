@@ -180,6 +180,30 @@ body {
 }
 .doctor-bad { border-color: rgba(226, 106, 106, 0.4); }
 
+/* settings: local tools */
+.tool-disclosure {
+  font-size: 12px; color: var(--amber); margin: 0.5rem 0 0.75rem;
+  border: 1px dashed rgba(224, 164, 88, 0.4); border-radius: 8px; padding: 6px 10px;
+}
+.server-block { border-top: 1px solid var(--line); padding: 0.6rem 0; }
+.server-name { font-size: 12.5px; color: var(--ink-2); margin-bottom: 0.4rem; }
+.tool-row {
+  display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+  padding: 0.35rem 0;
+}
+.tool-row-name { font-size: 12.5px; min-width: 12rem; }
+.tool-row-desc { flex: 1; font-size: 12.5px; min-width: 12rem; }
+.tool-row-modes { display: flex; gap: 4px; }
+.mode-pill {
+  background: transparent; border: 1px solid var(--line-2); color: var(--ink-3);
+  border-radius: 999px; padding: 2px 10px; font-size: 11px; cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.mode-pill:hover { color: var(--ink); }
+.mode-pill.active.allow { color: var(--green); border-color: rgba(116, 214, 160, 0.35); background: rgba(116, 214, 160, 0.08); }
+.mode-pill.active.ask { color: var(--ink); border-color: rgba(234, 242, 237, 0.3); background: rgba(234, 242, 237, 0.06); }
+.mode-pill.active.deny { color: var(--danger); border-color: rgba(226, 106, 106, 0.35); background: rgba(226, 106, 106, 0.08); }
+
 /* ── chat ───────────────────────────────────────────────── */
 .chat-head { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; }
 .chat-log {
@@ -210,6 +234,37 @@ body {
 }
 .turn-error { color: var(--danger); font-size: 12px; margin-top: 4px; }
 .turn-error-card { border-color: rgba(226, 106, 106, 0.35); }
+
+/* local tool calls inside an assistant turn */
+.msg-path { color: var(--green-dim); }
+.msg-disclosure {
+  font-size: 11.5px; color: var(--amber); margin-bottom: 4px;
+  border: 1px dashed rgba(224, 164, 88, 0.4); border-radius: 8px; padding: 4px 8px;
+}
+.msg-tools { margin-bottom: 4px; font-size: 12px; }
+.msg-tools summary { cursor: pointer; color: var(--green-dim); width: fit-content; }
+.tool-entry {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+  margin: 4px 0; background: var(--surface);
+}
+.tool-line { font-size: 12px; }
+.tool-ok { color: var(--green); }
+.tool-denied { color: var(--amber); }
+.tool-failed { color: var(--danger); }
+.tool-args {
+  margin: 4px 0 0; padding: 4px 6px; font-size: 11px; color: var(--ink-2);
+  background: var(--bg-2); border-radius: 6px; white-space: pre-wrap;
+  word-break: break-word; max-height: 8rem; overflow-y: auto;
+}
+.tool-perm { margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.tool-perm-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+.tool-answered { margin-top: 4px; font-size: 11px; }
+.tool-result summary { cursor: pointer; width: fit-content; }
+.tool-result-text {
+  margin: 4px 0 0; padding: 4px 6px; font-size: 11px; color: var(--ink-2);
+  background: var(--bg-2); border-radius: 6px; white-space: pre-wrap;
+  word-break: break-word; max-height: 12rem; overflow-y: auto;
+}
 .cursor { animation: blink 1s steps(2, start) infinite; color: var(--green); }
 @keyframes blink { to { visibility: hidden; } }
 @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }

@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 import Chat from './views/Chat.vue'
 import Settings from './views/Settings.vue'
 import { restoreChats } from './chat'
-import { needsToken, storedToken, saveToken } from './api'
+import { loadClientState, needsToken, storedToken, saveToken } from './api'
 
 // Two tabs; ?tab= deep-links (the chat keeps its ?chat= while open).
 type TabID = 'chat' | 'settings'
@@ -40,6 +40,7 @@ function setTab(t: TabID) {
 onMounted(() => {
   syncURL() // canonical form on boot
   restoreChats()
+  void loadClientState() // tools on? the web-search default?
 })
 
 // A non-loopback listener requires the local token: the page asks once

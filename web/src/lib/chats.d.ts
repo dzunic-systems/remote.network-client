@@ -10,6 +10,23 @@ export interface Attachment {
   name: string
 }
 
+// One local tool call inside an assistant turn (rendered as text only).
+export interface ToolStep {
+  id: string
+  name: string
+  server: string
+  tool: string
+  arguments: string
+  askId?: string
+  answered?: 'once' | 'always' | 'deny'
+  done?: boolean
+  ok?: boolean
+  denied?: boolean
+  ms?: number
+  bytes?: number
+  result?: string
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant'
   text: string
@@ -23,6 +40,9 @@ export interface ChatMessage {
   searchQuery?: string
   searchQueries?: string[]
   searchNote?: string
+  tools?: ToolStep[] // local tool calls this turn made
+  path?: string // the turn's route: direct | router
+  disclosure?: string // the tools' privacy disclosure, once per server
 }
 
 export interface ChatMeta {

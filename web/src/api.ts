@@ -92,11 +92,71 @@ function tokenHeaders(): Record<string, string> {
   return tok ? { 'X-Local-Token': tok } : {}
 }
 
+export interface ToolView {
+  name: string
+  server: string
+  tool: string
+  description: string
+  mode: 'allow' | 'ask' | 'deny'
+}
+
+export interface ServerView {
+  name: string
+  tools: ToolView[]
+}
+
+// The agent loop's SSE event (POST /ui/api/chat), mirrored from the Go
+// agent.Event. Tool arguments and results are rendered as text only.
+export interface ToolEvent {
+  type: 'round' | 'delta' | 'tool_call' | 'permission' | 'tool_result' | 'disclosure' | 'done' | 'error'
+  round?: number
+  content?: string
+  reasoning?: string
+  id?: string
+  name?: string
+  server?: string
+  tool?: string
+  arguments?: string
+  ok?: boolean
+  ms?: number
+  bytes?: number
+  text?: string
+  path?: 'direct' | 'router' | ''
+  model?: string
+  finish?: string
+  message?: string
+}
+
 export const api = {
   models: () => get<{ models: ModelCard[] }>('/api/v1/models'),
-  settings: () => get<{ settings: SettingView[] }>('/ui/api/settings'),
+  settings: () => get<{ settings: SettingView[]; tools_enabled: boolean }>('/ui/api/settings'),
   setSetting: (key: string, value: string | boolean) =>
     send<{ ok: boolean; restart: boolean }>('/ui/api/settings', 'POST', { key, value }),
   replaceKey: (apiKey: string) => send<{ ok: boolean }>('/ui/api/login', 'POST', { api_key: apiKey }),
   doctor: () => send<{ ok: boolean; report: string }>('/ui/api/doctor', 'POST'),
+  tools: () => get<{ servers: ServerView[]; disclosure: string; error?: string }>('/ui/api/tools'),
+  setToolMode: (name: string, mode: ToolView['mode']) =>
+    send<{ ok: boolean }>('/ui/api/tools/mode', 'POST', { name, mode }),
+  decide: (ask_id: string, decision: 'once' | 'always' | 'deny') =>
+    send<{ ok: boolean }>('/ui/api/tools/decide', 'POST', { ask_id, decision }),
+}
+
+// The one fetch every view shares at boot: whether turns run the tool
+// loop (tools on AND at least one server configured), and the resolved
+// web-search default.
+export const clientState = ref<{ toolsEnabled: boolean; webSearchDefault: boolean }>({
+  toolsEnabled: false,
+  webSearchDefault: false,
+})
+
+export async function loadClientState(): Promise<void> {
+  try {
+    const s = await api.settings()
+    clientState.value.toolsEnabled = s.tools_enabled
+    for (const row of s.settings) {
+      if (row.key === 'web_search' && row.kind === 'bool') clientState.value.webSearchDefault = !!row.value
+    }
+  } catch {
+    /* the settings page shows the error; chat works without tools */
+  }
 }

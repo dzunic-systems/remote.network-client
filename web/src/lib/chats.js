@@ -88,11 +88,19 @@ export function oldestFirst(index, keep = []) {
 
 // slimForStorage keeps the last MAX_STORED messages without image data
 // (base64 turns blow the ~5 MB quota in a turn or two); how many images a
-// turn carried survives so the UI can say they were not kept.
+// turn carried survives so the UI can say they were not kept. Tool result
+// TEXT is dropped too (up to 64 KiB per call) — the call, its size and
+// its verdict survive; the full text is the model's business, not the
+// archive's.
 export function slimForStorage(messages, max = MAX_STORED) {
   return messages.slice(-max).map((m) => {
-    if (!m.images?.length) return { ...m, images: undefined }
-    return { ...m, images: undefined, imageCount: (m.imageCount ?? 0) + m.images.length }
+    const slim = m.images?.length
+      ? { ...m, images: undefined, imageCount: (m.imageCount ?? 0) + m.images.length }
+      : { ...m, images: undefined }
+    if (m.tools?.length) {
+      slim.tools = m.tools.map((t) => ({ ...t, result: undefined }))
+    }
+    return slim
   })
 }
 

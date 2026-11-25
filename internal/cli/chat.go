@@ -1,11 +1,11 @@
 package cli
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,14 +13,19 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"remote.network/client/internal/agent"
 	"remote.network/client/internal/config"
 	"remote.network/client/internal/nat"
+	"remote.network/client/internal/permissions"
 	"remote.network/client/internal/proxy"
+	"remote.network/client/internal/tools"
+	"remote.network/node/clientproto"
 	"remote.network/node/identity"
 )
 
 func newChatCommand() *cobra.Command {
 	var model, apiKey, apiKeyFile, keyFile, router string
+	var effort string
 	var noDirect, webSearch bool
 	cmd := &cobra.Command{
 		Use:   "chat --model MODEL \"prompt\"",
@@ -85,24 +90,37 @@ func newChatCommand() *cobra.Command {
 				}
 				prompt += a
 			}
-			body := map[string]any{
-				"model":    s.DefaultModel.Value,
-				"messages": []map[string]any{{"role": "user", "content": prompt}},
+			history := []clientproto.Message{{Role: "user", Content: jsonRawString(prompt)}}
+
+			// One path for every chat: the agent loop, streaming. With MCP
+			// servers configured it offers their tools (the proxy never does
+			// — a third-party request with its own tools passes through
+			// untouched); without, it is one plain round. Either way the
+			// answer prints as text while it generates, the model's thinking
+			// goes to stderr, and an error is a message, not a JSON body.
+			loop := &agent.Loop{Proxy: srv.Handler(), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			if s.Tools.Value {
+				cfg, terr := tools.LoadConfig(s.MCPConfig.Value)
+				if terr != nil {
+					return fmt.Errorf("the MCP config could not be read (%w) — fix it or run with tools off (REMOTE_TOOLS=off)", terr)
+				}
+				if len(cfg) > 0 {
+					reg := tools.NewRegistry(cfg, loop.Log)
+					defer reg.Close()
+					perms, perr := permissions.Load()
+					if perr != nil {
+						perms = permissions.NewMemory()
+					}
+					loop.Tools, loop.Perms, loop.Ask = reg, perms, newTTYAsker()
+				}
 			}
-			if s.WebSearch.Value {
-				body["web_search"] = true
-			}
-			b, _ := json.Marshal(body)
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1/v1/chat/completions", bytes.NewReader(b))
-			if err != nil {
-				return err
-			}
-			out := &stdoutWriter{out: cmd.OutOrStdout()}
-			srv.Handler().ServeHTTP(out, req)
-			if out.code < 200 || out.code >= 300 {
-				return fmt.Errorf("request failed (%d)", out.code)
-			}
-			return nil
+			pr := newChatPrinter(cmd)
+			_, terr := loop.Turn(ctx, agent.TurnInput{
+				Model: s.DefaultModel.Value, Messages: history, Effort: effort,
+				WebSearch: s.WebSearch.Value, Stream: true,
+			}, pr.event)
+			pr.finish()
+			return terr
 		},
 	}
 	cmd.Flags().StringVar(&model, "model", "", "the model to ask for (default: config file default_model, env REMOTE_DEFAULT_MODEL)")
@@ -112,31 +130,6 @@ func newChatCommand() *cobra.Command {
 	cmd.Flags().StringVar(&keyFile, "key-file", "", "this client's identity key (default ~/.remote/client.key)")
 	cmd.Flags().BoolVar(&noDirect, "no-direct", false, "send everything through the router")
 	cmd.Flags().BoolVar(&webSearch, "web-search", false, "ground the answer in a router-run web search")
+	cmd.Flags().StringVar(&effort, "effort", "", "reasoning effort for thinking models: off, low, medium, high (default: the model's own)")
 	return cmd
 }
-
-// stdoutWriter is the http.ResponseWriter the chat command serves one
-// request into: status captured, body straight to the terminal.
-type stdoutWriter struct {
-	out  interface{ Write([]byte) (int, error) }
-	code int
-	head http.Header
-}
-
-func (w *stdoutWriter) Header() http.Header {
-	if w.head == nil {
-		w.head = http.Header{}
-	}
-	return w.head
-}
-
-func (w *stdoutWriter) WriteHeader(code int) { w.code = code }
-
-func (w *stdoutWriter) Write(b []byte) (int, error) {
-	if w.code == 0 {
-		w.code = http.StatusOK
-	}
-	return w.out.Write(b)
-}
-
-func (w *stdoutWriter) Flush() {}

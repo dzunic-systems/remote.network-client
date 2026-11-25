@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,5 +152,60 @@ func TestLoopbackGateCoversUIToo(t *testing.T) {
 	f.proxy.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("foreign origin on /ui/: %d", rec.Code)
+	}
+}
+
+// TestProxyNeverInjectsTools (the tools phase's §3.5 rule): the proxy is
+// a conduit. A third-party request carrying its own tools routes with
+// needs.tools=true and falls back byte-identical; a request without
+// tools never gains any. No MCP machinery exists at this layer at all —
+// this test pins it.
+func TestProxyNeverInjectsTools(t *testing.T) {
+	f := newFX(t)
+	var routed map[string]any
+	var fallbackBody string
+	f.routeAnswer = func(w http.ResponseWriter, _ *http.Request, body map[string]any) {
+		routed = body
+		writeJSON(w, map[string]any{"direct": false, "reason": "disabled"})
+	}
+	f.fallback = func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		fallbackBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}
+	f.start(true) // the desk is asked (direct:false answers → the fallback)
+
+	withTools := `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"mine","parameters":{"type":"object"}}}]}`
+	if rec := f.post(withTools); rec.Code != http.StatusOK {
+		t.Fatalf("with tools: %d", rec.Code)
+	}
+	needs, _ := routed["needs"].(map[string]any)
+	if needs == nil || needs["tools"] != true {
+		t.Fatalf("route ask needs = %v, want tools:true", routed["needs"])
+	}
+	var fwd struct {
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(fallbackBody), &fwd); err != nil {
+		t.Fatalf("fallback body: %v", err)
+	}
+	if len(fwd.Tools) != 1 || fwd.Tools[0]["function"].(map[string]any)["name"] != "mine" {
+		t.Fatalf("the request's own tools were not forwarded verbatim: %s", fallbackBody)
+	}
+
+	// Without tools: nothing appears.
+	f.mu.Lock()
+	routed = nil
+	f.mu.Unlock()
+	if rec := f.post(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("without tools: %d", rec.Code)
+	}
+	needs, _ = routed["needs"].(map[string]any)
+	if needs["tools"] != false {
+		t.Fatalf("route ask needs = %v, want tools:false", routed["needs"])
+	}
+	if strings.Contains(fallbackBody, "tools") {
+		t.Fatalf("tools appeared in a plain request: %s", fallbackBody)
 	}
 }

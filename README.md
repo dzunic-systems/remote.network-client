@@ -41,8 +41,40 @@ and check it against `checksums.txt`.
 
    A small web UI comes with it: open http://127.0.0.1:4141/ui/ for
    chat with the network's models, every setting with the source it
-   resolved from, a key replacement, and the same check `doctor` runs.
-   Turn it off with `--no-ui`.
+   resolved from, a key replacement, the same check `doctor` runs, and
+   the local tools (below). Turn it off with `--no-ui`.
+
+## Local tools (MCP)
+
+`serve` and `chat` can run tools on this machine and hand them to the
+model. Configure servers in `~/.remote/mcp.json` — stdio MCP servers,
+same shape as Claude Code's:
+
+```json
+{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}
+```
+
+With servers configured, tools turn on by default (`tools: off` turns
+them off). The web UI and `chat` then run a tool loop; each exposed
+tool name is `<server>__<tool>`.
+
+**Permission first.** Every tool starts at `ask`: the UI shows an
+inline prompt (Allow once / Always allow this tool / Deny); `chat`
+prompts on the terminal, and with no terminal a tool is denied. Modes
+live in `~/.remote/permissions.json` (0600) and on the Settings page.
+
+**The privacy boundary:** a tool's result is sent to the node that
+serves the model — a third party's machine, unless it is your own node.
+Local file contents leave this machine when a tool reads them. The UI
+says so before a server's first run, and on the Settings page.
+
+Bounds: at most 10 tool rounds per turn, a tool result is truncated at
+64 KiB, a tool call times out after 60 s, and cancelling the turn kills
+the in-flight tool call. Logs record the tool name, duration and size —
+never arguments or results.
+
+The OpenAI-compatible endpoint never injects tools: a request that
+carries its own (Cursor, an SDK) passes through untouched.
 
 Other commands:
 
@@ -96,7 +128,13 @@ tool config together.
 - If a node cannot answer before its first token, the next candidate is
   tried, then the router.
 - Requests that need router-side features always go through the router:
-  web search, attachments, and `n > 1`.
+  web search, attachments, and `n > 1`. A turn with web search on always
+  rides the router; only plain turns go direct. The web UI shows each
+  turn's path ("via direct" / "via router") on the answer.
+- With web search AND local tools on the same turn, the router runs its
+  search loop around the client's tools: the client's tool calls come
+  back to this machine and are executed here (permission and all), never
+  by the router.
 - Billing does not depend on the path. The node signs a receipt for what
   it served, the router bills it within the ticket's limits, and the
   client's own count is only a cross-check.

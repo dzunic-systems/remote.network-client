@@ -20,10 +20,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"remote.network/client/internal/agent"
 	"remote.network/client/internal/config"
 	"remote.network/client/internal/doctor"
 	"remote.network/client/internal/nat"
+	"remote.network/client/internal/permissions"
 	"remote.network/client/internal/proxy"
+	"remote.network/client/internal/tools"
 	"remote.network/client/internal/ui"
 	"remote.network/client/web"
 	"remote.network/node/identity"
@@ -96,10 +99,12 @@ func newServeCommand() *cobra.Command {
 				})
 			}
 
-			// The web UI: settings (with their sources), Replace key, and
-			// the doctor check — all backed by this run's resolution, so a
-			// flag-locked setting shows as locked here too.
+			// The web UI: settings (with their sources), Replace key, the
+			// doctor check, and the local tools (MCP servers + the agent
+			// loop) — all backed by this run's resolution, so a flag-locked
+			// setting shows as locked here too.
 			var uiHandler http.Handler
+			var uiLoop *agent.Loop                  // set inside the UI block; wired to the proxy below
 			var srvRef atomic.Pointer[proxy.Server] // set once the proxy exists; the UI's key hand-off
 			curKey := func() string {
 				if p := srvRef.Load(); p != nil {
@@ -108,6 +113,31 @@ func newServeCommand() *cobra.Command {
 				return s.APIKey.Value
 			}
 			if s.UI.Value {
+				// The tool loop is the UI's chat surface; the registry
+				// holds the configured MCP servers (a broken mcp.json does
+				// not stop serve — the first turn surfaces it).
+				uiLog := slog.New(slog.NewTextHandler(os.Stderr, logOpts(s.LogLevel.Value)))
+				var reg *tools.Registry
+				if cfg, terr := tools.LoadConfig(s.MCPConfig.Value); terr != nil {
+					uiLog.Warn("the MCP config could not be read — no local tools this run", "err", terr)
+				} else if len(cfg) == 0 {
+					// no servers configured
+				} else {
+					reg = tools.NewRegistry(cfg, uiLog)
+					defer reg.Close()
+				}
+				perms, perr := permissions.Load()
+				if perr != nil {
+					uiLog.Warn("the permissions file could not be read — every tool will ask", "err", perr)
+					perms = permissions.NewMemory()
+				}
+				if reg != nil && !reg.Empty() && s.Tools.Value {
+					uiLoop = &agent.Loop{
+						Perms: perms, Tools: reg, Log: uiLog,
+						LocalToken: s.LocalToken.Value,
+					}
+				}
+				toolsOn := func() bool { return uiLoop != nil }
 				uiHandler = ui.New(ui.Config{
 					Dist:     web.Dist(),
 					Settings: func() (config.Settings, error) { return config.Resolve(fl) },
@@ -117,6 +147,7 @@ func newServeCommand() *cobra.Command {
 							p.SetAPIKey(k)
 						}
 					},
+					Loop: uiLoop, Reg: reg, Perms: perms, ToolsOn: toolsOn,
 					Doctor: func(rctx context.Context) (string, bool) {
 						var buf bytes.Buffer
 						res, derr := doctor.Run(rctx, doctor.Options{
@@ -139,6 +170,12 @@ func newServeCommand() *cobra.Command {
 				return err
 			}
 			srvRef.Store(srv)
+			// The tool loop drives its rounds through the proxy's own
+			// handler (in-process), so each round takes its own direct or
+			// fallback path.
+			if uiLoop != nil {
+				uiLoop.Proxy = srv.Handler()
+			}
 			defer srv.Close()
 
 			httpSrv := &http.Server{

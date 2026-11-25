@@ -10,15 +10,15 @@
 // router's web-search frames ride the same stream; there are no accounts
 // and no node pinning here.
 import { reactive, watch } from 'vue'
-import { api, needsToken, storedToken } from './api'
+import { api, clientState, needsToken, storedToken, type ToolEvent } from './api'
 import {
   emptyIndex, newMeta, deriveTitle, touch, removeChat, evict, oldestFirst,
   slimForStorage,
-  type ChatIndex, type ChatMessage, type ChatMeta, type SearchSource,
+  type ChatIndex, type ChatMessage, type ChatMeta, type SearchSource, type ToolStep,
 } from './lib/chats.js'
 import { makeStorage } from './lib/chatStorage.js'
 
-export type { ChatMessage, ChatMeta, SearchSource } from './lib/chats.js'
+export type { ChatMessage, ChatMeta, SearchSource, ToolStep } from './lib/chats.js'
 
 interface ChatState {
   index: ChatIndex
@@ -332,107 +332,44 @@ export async function sendChat(text: string, images: string[] = []) {
       .filter((m) => !m.error && (m.text || m.images?.length || m.role === 'user'))
       .map((m) => ({ role: m.role, content: m.role === 'assistant' ? m.text || '(empty)' : parts(m) }))
       .slice(-MAX_TURNS)
-    const body: Record<string, unknown> = {
-      model, messages: history, stream: true,
-      reasoning_effort: state.effort || undefined,
-    }
-    if (state.webSearch) body.web_search = true
-    const resp = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...tokenHeaders() },
-      body: JSON.stringify(body),
-      signal: abort.signal,
-    })
-    if (resp.status === 401) needsToken.value = true
-    if (!resp.ok || !resp.body) {
-      let msg = `HTTP ${resp.status}`
-      try {
-        const errBody = await resp.json()
-        msg = errBody?.error?.message ?? msg
-      } catch { /* not JSON */ }
-      throw new Error(msg)
-    }
 
-    // Hand-rolled SSE framing: frame boundaries inside network chunks,
-    // and comment lines.
-    const reader = resp.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let usage: { input: number; output: number } | null = null
-    let finish: string | null = null
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let split: number
-      while ((split = buffer.indexOf('\n\n')) !== -1) {
-        const frame = buffer.slice(0, split)
-        buffer = buffer.slice(split + 2)
-        for (const line of frame.split('\n')) {
-          if (!line.startsWith('data:')) continue
-          const payload = line.slice(5).trim()
-          if (payload === '[DONE]') continue
-          let chunk: {
-            choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
-            usage?: { prompt_tokens: number; completion_tokens: number }
-            web_search?: { query?: string; results?: SearchSource[]; note?: string }
-            error?: { message?: string; code?: string }
-          }
-          try {
-            chunk = JSON.parse(payload)
-          } catch {
-            continue // keepalive or unparseable frame
-          }
-          // A failure after the stream opened arrives as an error event —
-          // the turn's error card, not a silent end.
-          if (chunk.error) throw new Error(chunk.error.message ?? chunk.error.code ?? 'the stream failed')
-          const choice = chunk.choices?.[0]
-          if (choice?.finish_reason) finish = choice.finish_reason
-          const delta = choice?.delta
-          if (delta?.content) shell.text += delta.content
-          if (delta?.reasoning_content) {
-            shell.reasoning = (shell.reasoning ?? '') + delta.reasoning_content
-          }
-          if (delta?.content || delta?.reasoning_content) saveStreamingSoon(chatId)
-          if (chunk.web_search) {
-            // Sources frame: shown while the answer streams in. The router
-            // emits one SNAPSHOT per executed search/fetch (the agentic
-            // loop), so accumulate and dedupe by url: every round's
-            // sources stay visible, the latest query on top.
-            const ws = chunk.web_search
-            if (ws.query) {
-              shell.searchQuery = ws.query
-              // The model formulates several queries per turn. Keep them all.
-              if (!shell.searchQueries?.includes(ws.query)) {
-                shell.searchQueries = [...(shell.searchQueries ?? []), ws.query]
-              }
-            }
-            const seen = new Set((shell.search ?? []).map((s) => s.url))
-            shell.search = [
-              ...(shell.search ?? []),
-              ...(ws.results ?? []).filter((r) => !seen.has(r.url)),
-            ]
-            if (ws.note) shell.searchNote = ws.note
-          }
-          if (chunk.usage) {
-            usage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens }
-          }
-        }
+    if (clientState.value.toolsEnabled) {
+      // The tool loop: the server runs the rounds; the page renders the
+      // events (tool calls, permission prompts, results) as they come.
+      const resp = await fetch('/ui/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...tokenHeaders() },
+        body: JSON.stringify({
+          model, messages: history, stream: true,
+          effort: state.effort || undefined,
+          web_search: state.webSearch || undefined,
+        }),
+        signal: abort.signal,
+      })
+      if (resp.status === 401) needsToken.value = true
+      if (!resp.ok || !resp.body) {
+        let msg = `HTTP ${resp.status}`
+        try {
+          const errBody = await resp.json()
+          msg = errBody?.error?.message ?? msg
+        } catch { /* not JSON */ }
+        throw new Error(msg)
       }
-    }
-    if (usage && !shell.text && !shell.reasoning) {
-      shell.text = '(empty response)'
-    }
-    // A stream that completed with thinking but no answer text used to end
-    // in silence — the cursor vanishes, nothing replaces it, no error card.
-    // The wire told the truth — finish_reason=length, or a stop after
-    // reasoning — the UI just dropped it. Say what happened; aborts (finish
-    // stays null) keep their own handling below.
-    if (!shell.text && shell.reasoning && finish) {
-      shell.text =
-        finish === 'length'
-          ? '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
-          : '(the model thought but wrote no answer — send "continue" to have it answer)'
+      const finish = await readToolStream(resp.body, shell, chatId)
+      // The same silent endings the plain stream handles: a turn that
+      // produced only thinking (or nothing) and stopped says so instead
+      // of vanishing under the cursor.
+      if (!shell.text && !shell.reasoning && finish && finish !== 'tool_calls') {
+        shell.text =
+          finish === 'length'
+            ? '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
+            : '(the model thought but wrote no answer — send "continue" to have it answer)'
+      }
+    } else {
+      const resp = await plainChatBody(model, history)
+      shell.path = resp.headers.get('X-Remote-Path') || undefined
+      const finish = await readPlainStream(resp, shell, chatId)
+      applyPlainEnding(shell, finish)
     }
     shell.model = model
   } catch (e) {
@@ -462,4 +399,214 @@ export async function sendChat(text: string, images: string[] = []) {
 function tokenHeaders(): Record<string, string> {
   const tok = storedToken()
   return tok ? { 'X-Local-Token': tok } : {}
+}
+
+// ── the plain turn: the local OpenAI wire ────────────────────────────
+
+async function plainChatBody(model: string, history: unknown[]): Promise<Response> {
+  const body: Record<string, unknown> = {
+    model, messages: history, stream: true,
+    reasoning_effort: state.effort || undefined,
+  }
+  if (state.webSearch) body.web_search = true
+  const resp = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...tokenHeaders() },
+    body: JSON.stringify(body),
+    signal: abort!.signal,
+  })
+  if (resp.status === 401) needsToken.value = true
+  if (!resp.ok || !resp.body) {
+    let msg = `HTTP ${resp.status}`
+    try {
+      const errBody = await resp.json()
+      msg = errBody?.error?.message ?? msg
+    } catch { /* not JSON */ }
+    throw new Error(msg)
+  }
+  return resp
+}
+
+// applyPlainEnding is the plain stream's silent-end handling: a stream
+// that completed with thinking but no answer text used to end in
+// silence — the cursor vanishes, nothing replaces it, no error card.
+// The wire told the truth; the UI says what happened.
+function applyPlainEnding(shell: ChatMessage, finish: string | null) {
+  if (!shell.text && !shell.reasoning && finish) {
+    shell.text =
+      finish === 'length'
+        ? '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
+        : '(the model thought but wrote no answer — send "continue" to have it answer)'
+  }
+}
+
+// readPlainStream parses the OpenAI chunk wire by hand — frame boundaries
+// do not align with network chunks, and `data: [DONE]` is not JSON —
+// streaming the reply into the live assistant message. Returns the
+// finish reason (null when the stream never said).
+async function readPlainStream(resp: Response, shell: ChatMessage, chatId: string): Promise<string | null> {
+  const reader = resp.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let usage: { input: number; output: number } | null = null
+  let finish: string | null = null
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let split: number
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split)
+      buffer = buffer.slice(split + 2)
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (payload === '[DONE]') continue
+        let chunk: {
+          choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
+          usage?: { prompt_tokens: number; completion_tokens: number }
+          web_search?: { query?: string; results?: SearchSource[]; note?: string }
+          error?: { message?: string; code?: string }
+        }
+        try {
+          chunk = JSON.parse(payload)
+        } catch {
+          continue // keepalive or unparseable frame
+        }
+        // A failure after the stream opened arrives as an error event —
+        // the turn's error card, not a silent end.
+        if (chunk.error) throw new Error(chunk.error.message ?? chunk.error.code ?? 'the stream failed')
+        const choice = chunk.choices?.[0]
+        if (choice?.finish_reason) finish = choice.finish_reason
+        const delta = choice?.delta
+        if (delta?.content) shell.text += delta.content
+        if (delta?.reasoning_content) {
+          shell.reasoning = (shell.reasoning ?? '') + delta.reasoning_content
+        }
+        if (delta?.content || delta?.reasoning_content) saveStreamingSoon(chatId)
+        if (chunk.web_search) {
+          // Sources frame: shown while the answer streams in. The router
+          // emits one SNAPSHOT per executed search/fetch (the agentic
+          // loop), so accumulate and dedupe by url.
+          const ws = chunk.web_search
+          if (ws.query) {
+            shell.searchQuery = ws.query
+            if (!shell.searchQueries?.includes(ws.query)) {
+              shell.searchQueries = [...(shell.searchQueries ?? []), ws.query]
+            }
+          }
+          const seen = new Set((shell.search ?? []).map((s) => s.url))
+          shell.search = [
+            ...(shell.search ?? []),
+            ...(ws.results ?? []).filter((r) => !seen.has(r.url)),
+          ]
+          if (ws.note) shell.searchNote = ws.note
+        }
+        if (chunk.usage) {
+          usage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens }
+        }
+      }
+    }
+  }
+  if (usage && !shell.text && !shell.reasoning) {
+    shell.text = '(empty response)'
+  }
+  return finish
+}
+
+// ── the tool turn: the agent loop's event stream ─────────────────────
+
+// readToolStream parses POST /ui/api/chat's SSE (one agent.Event per
+// frame): content deltas, tool calls, the permission prompts the user
+// answers inline, results, and the per-round path. Returns the final
+// round's finish reason.
+async function readToolStream(body: ReadableStream<Uint8Array>, shell: ChatMessage, chatId: string): Promise<string | null> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finish: string | null = null
+  const ensureTool = (id: string): ToolStep => {
+    shell.tools = shell.tools ?? []
+    let t = shell.tools.find((x) => x.id === id)
+    if (!t) {
+      t = { id, name: '', server: '', tool: '', arguments: '' }
+      shell.tools.push(t)
+    }
+    return t
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let split: number
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split)
+      buffer = buffer.slice(split + 2)
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (payload === '[DONE]') continue
+        let ev: ToolEvent
+        try {
+          ev = JSON.parse(payload)
+        } catch {
+          continue // keepalive or unparseable frame
+        }
+        switch (ev.type) {
+          case 'delta':
+            if (ev.content) shell.text += ev.content
+            if (ev.reasoning) shell.reasoning = (shell.reasoning ?? '') + ev.reasoning
+            if (ev.content || ev.reasoning) saveStreamingSoon(chatId)
+            break
+          case 'tool_call': {
+            const t = ensureTool(ev.id ?? String(shell.tools?.length ?? 0))
+            t.name = ev.name ?? t.name
+            t.server = ev.server ?? t.server
+            t.tool = ev.tool ?? t.tool
+            t.arguments = ev.arguments ?? t.arguments
+            break
+          }
+          case 'permission': {
+            // The ask rides the tool entry the call created (matched by
+            // server+tool; the loop asks exactly one tool at a time).
+            const pending = (shell.tools ?? []).filter((t) => t.server === ev.server && t.tool === ev.tool && !t.done)
+            const t = pending.length ? pending[pending.length - 1] : ensureTool(ev.id ?? 'ask')
+            t.askId = ev.id
+            break
+          }
+          case 'tool_result': {
+            const t = ensureTool(ev.id ?? String(shell.tools?.length ?? 0))
+            t.done = true
+            t.ok = ev.ok ?? false
+            t.denied = ev.text === 'denied by the user'
+            t.ms = ev.ms
+            t.bytes = ev.bytes
+            t.result = ev.text
+            break
+          }
+          case 'disclosure':
+            // The privacy boundary, once per server: local file contents
+            // leave the machine to wherever the model is served.
+            shell.disclosure = ev.text ?? shell.disclosure
+            break
+          case 'done':
+            shell.path = ev.path || shell.path
+            if (ev.finish) finish = ev.finish
+            break
+          case 'error':
+            throw new Error(ev.message ?? 'the turn failed')
+        }
+      }
+    }
+  }
+  return finish
+}
+
+// answerPermission is the inline prompt's button: the decision goes to
+// /ui/api/tools/decide and the loop continues on the same stream.
+export async function answerPermission(shell: ChatMessage, decision: 'once' | 'always' | 'deny') {
+  const pending = (shell.tools ?? []).find((t) => t.askId && !t.answered)
+  if (!pending || !pending.askId) return
+  pending.answered = decision
+  await api.decide(pending.askId, decision)
 }

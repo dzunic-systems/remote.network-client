@@ -6,13 +6,20 @@
 // exactly like `config set`); the router URL is never editable from the
 // browser, because changing it would send the API key to a new host.
 import { onMounted, ref } from 'vue'
-import { api, type SettingView } from '../api'
+import { api, clientState, type ServerView, type SettingView, type ToolView } from '../api'
 
 const settings = ref<SettingView[]>([])
+const toolsEnabled = ref(false)
 const error = ref('')
 const draft = ref<Record<string, string>>({})
 const savedKey = ref('')
 const restartKeys = ref<string[]>([])
+
+// the tools list (servers and their tools, never their commands)
+const toolServers = ref<ServerView[]>([])
+const toolDisclosure = ref('')
+const toolError = ref('')
+const toolsLoading = ref(false)
 
 // replace-key dialog
 const keyDialog = ref(false)
@@ -28,12 +35,46 @@ const doctorOK = ref<boolean | null>(null)
 async function refresh() {
   error.value = ''
   try {
-    settings.value = (await api.settings()).settings
+    const s = await api.settings()
+    settings.value = s.settings
+    toolsEnabled.value = s.tools_enabled
+    if (s.tools_enabled) void refreshTools()
   } catch (e) {
     error.value = String((e as Error)?.message ?? e).replace(/^Error: /, '')
   }
 }
 onMounted(refresh)
+
+// refreshTools lists the configured servers and their tools (this is what
+// launches them). Failures show per list; the healthy servers still list.
+async function refreshTools() {
+  toolsLoading.value = true
+  toolError.value = ''
+  try {
+    const doc = await api.tools()
+    toolServers.value = doc.servers
+    toolDisclosure.value = doc.disclosure
+    if (doc.error) toolError.value = doc.error
+  } catch (e) {
+    toolError.value = String((e as Error)?.message ?? e).replace(/^Error: /, '')
+  } finally {
+    toolsLoading.value = false
+  }
+}
+
+// setMode flips one tool's allow/ask/deny (the only tool change the page
+// may make; servers and their commands are file-only).
+async function setMode(t: ToolView, mode: ToolView['mode']) {
+  if (t.mode === mode) return
+  const before = t.mode
+  t.mode = mode
+  try {
+    await api.setToolMode(t.name, mode)
+  } catch (e) {
+    t.mode = before
+    toolError.value = String((e as Error)?.message ?? e).replace(/^Error: /, '')
+  }
+}
 
 function sourceLabel(s: SettingView): string {
   if (s.source === 'flag') return `set by ${s.source_name} (this run)`
@@ -188,6 +229,47 @@ function isAPIKeyRow(s: SettingView): boolean {
           </div>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <p class="kicker">Local tools</p>
+      <template v-if="!toolsEnabled">
+        <p class="muted" style="font-size: 13px; margin: 0">
+          The tool loop is off — turn it on with <span class="mono">tools: on</span> (or
+          <span class="mono">config set tools on</span>) and configure servers in the MCP
+          config file (its row above). A chat without tools is unaffected.
+        </p>
+      </template>
+      <template v-else>
+        <p class="muted" style="font-size: 13px; margin: 0 0 0.75rem">
+          Servers come from the MCP config file — the page never adds or repoints one (the
+          file names commands this machine runs). What the page may change is a tool's
+          permission: <span class="mono">allow</span> runs it without asking,
+          <span class="mono">ask</span> prompts every turn (the default),
+          <span class="mono">deny</span> refuses it.
+        </p>
+        <div v-if="toolDisclosure" class="tool-disclosure mono">{{ toolDisclosure }}</div>
+        <div v-if="toolError" class="turn-error mono" style="margin: 0.5rem 0">{{ toolError }}</div>
+        <p v-if="toolsLoading && !toolServers.length" class="muted mono" style="font-size: 12px">listing tools…</p>
+        <div v-for="s in toolServers" :key="s.name" class="server-block">
+          <div class="server-name mono">server: {{ s.name }}</div>
+          <div v-if="!s.tools.length" class="muted mono" style="font-size: 12px">no tools listed</div>
+          <div v-for="t in s.tools" :key="t.name" class="tool-row">
+            <div class="tool-row-name mono">{{ t.name }}</div>
+            <div class="tool-row-desc muted">{{ t.description }}</div>
+            <div class="tool-row-modes">
+              <button
+                v-for="m in (['allow', 'ask', 'deny'] as const)" :key="m"
+                class="mode-pill mono" :class="{ active: t.mode === m, [m]: t.mode === m }"
+                @click="setMode(t, m)"
+              >{{ m }}</button>
+            </div>
+          </div>
+        </div>
+        <button class="setting-action" :disabled="toolsLoading" @click="refreshTools">
+          {{ toolsLoading ? 'Listing…' : 'Refresh' }}
+        </button>
+      </template>
     </div>
 
     <div class="card">

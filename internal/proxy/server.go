@@ -943,6 +943,9 @@ func (f flushWriter) Write(p []byte) (int, error) {
 // role chunk, like the router's relayStream. Reports success.
 func (rd *render) begin() bool {
 	rd.started = true
+	// The turn's route, for the UI's per-turn path line (the client's
+	// own surfaces show "via direct"); set before any byte is written.
+	rd.w.Header().Set("X-Remote-Path", "direct")
 	if !rd.stream {
 		return true
 	}
@@ -1113,6 +1116,7 @@ func (s *Server) fallback(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	defer resp.Body.Close()
 	h := w.Header()
+	h.Set("X-Remote-Path", "router") // the turn's route, for the UI's path line
 	for _, k := range []string{"Content-Type", "Retry-After"} {
 		if v := resp.Header.Get(k); v != "" {
 			h.Set(k, v)

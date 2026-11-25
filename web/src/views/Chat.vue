@@ -9,11 +9,12 @@
 // switching tabs mid-answer does not kill the turn; coming back
 // re-attaches.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type ModelCard } from '../api'
+import { api, clientState, type ModelCard } from '../api'
 import {
   restoreChats, sendChat, stopStreaming, newChat, useChatState, openInChat,
-  activeMeta, setWebSearch,
+  activeMeta, setWebSearch, answerPermission,
 } from '../chat'
+import type { ChatMessage, ToolStep } from '../lib/chats.js'
 import ChatList from '../components/ChatList.vue'
 import { renderMarkdown } from '../lib/md.js'
 
@@ -108,26 +109,19 @@ function scrollToBottom() {
 }
 watch(() => chatState.messages.map((m) => m.text.length).join(), scrollToBottom)
 
-// The 🌐 toggle defaults to what the selected model can do: a tool-capable
-// card starts with the agentic search loop on; a non-tool card starts off
-// (flipping it on still works — pre-generation search serves cards without
-// function calling). Re-fires when the directory refresh flips a card's
-// tools flag; an id the directory doesn't list leaves the toggle alone.
+// The 🌐 toggle defaults to the resolved web_search setting (the server's
+// value, seed via clientState at boot) — the plan's "REMOTE_WEB_SEARCH and
+// a UI toggle set it for the client's own chat surfaces". A chat whose
+// user set the toggle keeps its own choice; switching to a chat that
+// still follows the default re-applies it.
 watch(
+  () => [chatState.model, clientState.value.webSearchDefault] as const,
   () => {
-    const m = models.value.find((x) => x.id === chatState.model)
-    return m ? `${m.id}|${m.tools}` : ''
-  },
-  (key) => {
-    // A chat whose user set the toggle keeps it; others follow the model.
-    if (key && activeMeta()?.webSearch == null) chatState.webSearch = key.endsWith('|true')
+    if (activeMeta()?.webSearch == null) chatState.webSearch = clientState.value.webSearchDefault
   },
 )
-// Switching to a chat that follows the default re-applies it (the model
-// may be the same, so the watcher above would not fire).
 watch(() => chatState.activeId, () => {
-  const m = models.value.find((x) => x.id === chatState.model)
-  if (m && activeMeta()?.webSearch == null) chatState.webSearch = !!m.tools
+  if (activeMeta()?.webSearch == null) chatState.webSearch = clientState.value.webSearchDefault
 })
 
 // ── attachments: images pasted/dropped/picked ───────────────────────
@@ -238,6 +232,21 @@ const canSend = computed(() =>
   !streaming.value &&
   (input.value.trim() !== '' || pendingImages.value.length > 0) &&
   !notChat.value && !ocrNeedsImage.value)
+
+// The permission prompt's buttons (Allow once / Always allow this tool /
+// Deny) answer the pending ask; the loop continues on its own stream.
+function answer(m: ChatMessage, decision: 'once' | 'always' | 'deny') {
+  return answerPermission(m, decision)
+}
+
+// A human size for a tool result's byte count.
+function sizeLabel(n?: number): string {
+  if (n == null) return ''
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MiB'
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KiB'
+  return n + ' B'
+}
+
 </script>
 
 <template>
@@ -290,11 +299,46 @@ const canSend = computed(() =>
           </div>
           <div v-if="m.role === 'assistant'" class="msg-meta mono muted">
             {{ m.model }}
+            <span v-if="m.path" class="msg-path" :title="'this turn traveled over the ' + (m.path === 'direct' ? 'direct QUIC path to the node' : 'router')">
+              · via {{ m.path }}
+            </span>
             <details v-if="m.reasoning" class="reasoning">
               <summary class="mono muted">thinking…</summary>
               <div class="reasoning-body mono">{{ m.reasoning }}</div>
             </details>
           </div>
+          <div v-if="m.disclosure" class="msg-disclosure mono">{{ m.disclosure }}</div>
+          <!-- Local tool calls: the model's own tools, run on this machine
+               after your permission. Arguments and results render as TEXT
+               only — they are model and server output, never markup. -->
+          <details v-if="m.tools?.length" class="msg-tools" :open="streamingHere && !(m.tools.every((t) => t.done))">
+            <summary class="mono muted">tools ({{ m.tools.length }})</summary>
+            <div v-for="t in m.tools" :key="t.id + t.name" class="tool-entry">
+              <div class="tool-line mono">
+                🔧 {{ t.name }}
+                <span v-if="t.done" :class="t.ok ? 'tool-ok' : (t.denied ? 'tool-denied' : 'tool-failed')">
+                  {{ t.denied ? 'denied' : (t.ok ? 'ok' : 'failed') }} · {{ t.ms }} ms · {{ sizeLabel(t.bytes) }}
+                </span>
+                <span v-else-if="!t.askId" class="muted">running…</span>
+              </div>
+              <pre class="tool-args mono">{{ t.arguments }}</pre>
+              <div v-if="t.askId && !t.answered" class="tool-perm">
+                <span class="mono">this tool needs your permission — its result goes to the node serving the model</span>
+                <div class="tool-perm-buttons">
+                  <Button label="Allow once" size="small" @click="answer(m, 'once')" />
+                  <Button label="Always allow this tool" severity="secondary" size="small" @click="answer(m, 'always')" />
+                  <Button label="Deny" severity="danger" size="small" @click="answer(m, 'deny')" />
+                </div>
+              </div>
+              <div v-else-if="t.answered" class="mono muted tool-answered">
+                {{ t.answered === 'deny' ? 'denied' : t.answered === 'always' ? 'always allowed' : 'allowed once' }}
+              </div>
+              <details v-if="t.result" class="tool-result">
+                <summary class="mono muted">result</summary>
+                <pre class="tool-result-text mono">{{ t.result }}</pre>
+              </details>
+            </div>
+          </details>
           <div
             v-if="m.role === 'assistant'" class="msg-body md"
             v-html="renderMarkdown(m.text) || (streamingHere && i === chatState.messages.length - 1 ? '<span class=&quot;cursor&quot;>▌</span>' : '')"

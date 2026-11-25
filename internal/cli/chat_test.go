@@ -16,6 +16,7 @@ import (
 func TestChatReachesRouter(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows: os.UserHomeDir reads USERPROFILE
 	for _, n := range []string{"REMOTE_HOME", "REMOTE_ROUTER", "REMOTE_API_KEY", "REMOTE_DIRECT", "REMOTE_DEFAULT_MODEL"} {
 		t.Setenv(n, "")
 	}

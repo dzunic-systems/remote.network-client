@@ -14,7 +14,9 @@ func TestWritesTightenLooseFiles(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows has no Unix permission bits (the user-profile ACL protects the files)")
 	}
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows: os.UserHomeDir reads USERPROFILE
 
 	// The key file, via its explicit path.
 	keyPath := filepath.Join(t.TempDir(), "client-api-key")

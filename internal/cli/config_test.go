@@ -14,6 +14,7 @@ func isolateEnv(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows: os.UserHomeDir reads USERPROFILE
 	for _, name := range []string{
 		"REMOTE_HOME", "REMOTE_ROUTER", "REMOTE_ROUTER_ALT", "REMOTE_LISTEN",
 		"REMOTE_PORT", "REMOTE_API_KEY", "REMOTE_API_KEY_FILE", "REMOTE_DIRECT",

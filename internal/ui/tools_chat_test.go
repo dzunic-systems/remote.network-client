@@ -137,6 +137,7 @@ func toolCallRound(name, args string) map[string]any {
 func TestUIChatToolTurnPermissionFlow(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows: os.UserHomeDir reads USERPROFILE
 	t.Setenv("REMOTE_HOME", "")
 	dir := filepath.Join(home, ".remote")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

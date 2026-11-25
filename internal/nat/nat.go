@@ -68,6 +68,8 @@ type Socket struct {
 
 	mu   sync.Mutex
 	info Info
+
+	nudge chan struct{} // Recheck: run a round now
 }
 
 // Bind opens the socket and transport. No network traffic happens until
@@ -86,6 +88,7 @@ func Bind(cfg Config) (*Socket, error) {
 	tr := &quic.Transport{Conn: sock}
 	s := &Socket{
 		sock: sock, tr: tr, cfg: cfg, log: cfg.Log.With("component", "nat"),
+		nudge: make(chan struct{}, 1),
 		obs: clientproto.NewObserver(func(b []byte, to net.Addr) error {
 			_, err := tr.WriteTo(b, to)
 			return err
@@ -103,6 +106,17 @@ func Bind(cfg Config) (*Socket, error) {
 		}
 	}()
 	return s, nil
+}
+
+// Recheck asks Run for a round now — the router saw this machine at a
+// different public address (the network changed: a VPN went up or
+// down), so the last verdict is stale. Never blocks; extra asks while one
+// is pending fold into it.
+func (s *Socket) Recheck() {
+	select {
+	case s.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // Transport is the QUIC transport direct dials ride.
@@ -210,6 +224,7 @@ func (s *Socket) Run(ctx context.Context, fetch func(ctx context.Context) ([]Rou
 		case <-ctx.Done():
 			return
 		case <-time.After(next):
+		case <-s.nudge:
 		}
 	}
 }

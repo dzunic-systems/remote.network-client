@@ -1100,3 +1100,64 @@ func TestWireVersion(t *testing.T) {
 		}
 	}
 }
+
+// TestAddrMismatchFallsBack: the desk saw this machine at another public
+// address than the observation named (a VPN went up or down). That is
+// the desk's refusal, not the request's: the request goes through the
+// router instead of surfacing the 400.
+func TestAddrMismatchFallsBack(t *testing.T) {
+	f := newFX(t)
+	f.routeAnswer = func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"client_addrs[0] must be …","type":"invalid_request_error","code":"client_addr_mismatch"}}`))
+	}
+	refBody := `{"router":true}` + "\n"
+	f.fallback = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(refBody))
+	}
+	f.start(true)
+	rec := f.post(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != refBody {
+		t.Fatalf("mismatch = %d %q (want the router's answer)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestUnreachableNodeCooldown: a node this network cannot reach costs one
+// dial timeout, not one per request — the next request inside the
+// cooldown skips it at once and goes to the router.
+func TestUnreachableNodeCooldown(t *testing.T) {
+	f := newFX(t)
+	ep := f.addNode("real", goodScript)
+	dead, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep.Endpoint = dead.LocalAddr().String()
+	dead.Close() // nothing answers there
+	f.routeAnswer = f.candidate(ep, "test-node-side")
+	f.fallback = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"router":true}` + "\n"))
+	}
+	f.start(true)
+
+	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`
+	if rec := f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("first = %d %q", rec.Code, rec.Body.String())
+	}
+	t0 := time.Now()
+	if rec := f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("second = %d %q", rec.Code, rec.Body.String())
+	}
+	if d := time.Since(t0); d > time.Second {
+		t.Fatalf("second request took %s: the cooldown did not skip the dead node", d)
+	}
+	f.mu.Lock()
+	n := f.fallbacks
+	f.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("fallbacks = %d, want 2", n)
+	}
+}

@@ -358,6 +358,16 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
+		// The router saw this machine at another public address than the
+		// last observation named: the network changed (a VPN went up or
+		// down). That is the desk's refusal, not the request's — recheck
+		// now and send this one through the router.
+		if resp.StatusCode == http.StatusBadRequest && apiErrorCode(b) == "client_addr_mismatch" {
+			s.log.Debug("public address changed — rechecking, this request goes through the router")
+			s.cfg.NAT.Recheck()
+			s.pool.ForgetFailures()
+			return nil, routeFallback
+		}
 		// Admission (402/403/…): the same answer the fallback would get.
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		w.WriteHeader(resp.StatusCode)
@@ -848,4 +858,17 @@ func newRequestID() string {
 		panic("crypto/rand unavailable: " + err.Error())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// apiErrorCode reads error.code from a router error body ("" when absent).
+func apiErrorCode(b []byte) string {
+	var doc struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(b, &doc) != nil {
+		return ""
+	}
+	return doc.Error.Code
 }

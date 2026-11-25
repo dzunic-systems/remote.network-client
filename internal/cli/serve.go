@@ -26,7 +26,7 @@ import (
 
 func newServeCommand() *cobra.Command {
 	var router, listen, apiKey, apiKeyFile, localToken, keyFile, routerAlt string
-	var noDirect bool
+	var noDirect, verbose bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the local OpenAI-compatible endpoint (http://127.0.0.1:4141/v1)",
@@ -100,7 +100,7 @@ func newServeCommand() *cobra.Command {
 				Router: router, APIKey: apiKey, LocalToken: localToken,
 				ClientKey: clientKey, NAT: natSock, Direct: direct,
 				Version: Version,
-				Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				Log:     slog.New(slog.NewTextHandler(os.Stderr, logOpts(verbose))),
 			})
 			if err != nil {
 				return err
@@ -144,6 +144,7 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&localToken, "local-token", "", "secret clients must present when the listener is not loopback-only")
 	cmd.Flags().StringVar(&keyFile, "key-file", "", "this client's identity key (default ~/.remote/client.key)")
 	cmd.Flags().BoolVar(&noDirect, "no-direct", false, "send everything through the router")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "log why each direct attempt was refused or fell back (never logs the key or prompts)")
 	return cmd
 }
 
@@ -234,4 +235,14 @@ func directInfoEndpoints(ctx context.Context, hc *http.Client, urls []string) ([
 		return nil, lastErr
 	}
 	return out, nil
+}
+
+// logOpts is the serve log level: --verbose adds the per-candidate
+// decisions (dial failures, pre-token refusals and their codes, route
+// fallbacks).
+func logOpts(verbose bool) *slog.HandlerOptions {
+	if verbose {
+		return &slog.HandlerOptions{Level: slog.LevelDebug}
+	}
+	return nil
 }

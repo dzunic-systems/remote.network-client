@@ -367,6 +367,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.
 	}
 	var doc routeDoc
 	if json.Unmarshal(b, &doc) != nil || !doc.Direct || len(doc.Candidates) == 0 {
+		s.log.Debug("no direct route — falling back", "reason", doc.Reason)
 		return nil, routeFallback // disabled, no direct node, client too old
 	}
 	return doc.Candidates, routeOK
@@ -530,6 +531,7 @@ func (s *Server) tryCandidate(w http.ResponseWriter, r *http.Request, req *clien
 	// over, mid-stream-error frame like the router's — phrased by what
 	// the read saw (R6: a stall deadline is not a node death).
 	if !render.started {
+		s.log.Debug("candidate ended before its first token", "node_id", cand.NodeID, "err", sc.Err())
 		s.pool.Drop(cand.NodeID)
 		return outcomeRefused
 	}

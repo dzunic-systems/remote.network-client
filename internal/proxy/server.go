@@ -349,7 +349,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.
 	}
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
-	req2.Header.Set("X-Remote-Client", s.cfg.Version)
+	req2.Header.Set("X-Remote-Client", wireVersion(s.cfg.Version))
 	resp, err := s.hc.Do(req2)
 	if err != nil {
 		s.log.Debug("route failed — falling back", "err", err)
@@ -825,6 +825,18 @@ func identityPub(key ed25519.PrivateKey) string {
 		return ""
 	}
 	return identity.PubString(pub)
+}
+
+// wireVersion is the build version as the router's gate parses it: bare
+// dotted numbers. Release builds are stamped "v0.1.0" (the tag); a
+// leading v made v0.1.0 routers answer client_too_old to every route. A
+// pre-release or build suffix ("-dirty", "+meta") is dropped too.
+func wireVersion(v string) string {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexAny(v, "-+ "); i >= 0 {
+		v = v[:i]
+	}
+	return v
 }
 
 // newRequestID is a random 12-byte hex id (the router's req-id shape).

@@ -1088,3 +1088,15 @@ func TestOverflowErrorClasses(t *testing.T) {
 		}
 	}
 }
+
+// TestWireVersion: the release tag's "v" never reaches the router's gate
+// (a v0.1.0 client was told client_too_old by every router).
+func TestWireVersion(t *testing.T) {
+	for in, want := range map[string]string{
+		"v0.1.0": "0.1.0", "0.1.0": "0.1.0", "v0.1.1-dirty": "0.1.1", " v1.2.3+meta": "1.2.3", "dev": "dev",
+	} {
+		if got := wireVersion(in); got != want {
+			t.Fatalf("wireVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

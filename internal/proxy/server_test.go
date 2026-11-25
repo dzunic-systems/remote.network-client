@@ -1703,3 +1703,27 @@ func TestSpareRefusedTakesFreshRoute(t *testing.T) {
 		t.Fatalf("served = %d, want 2 (the fresh route answers, not the router)", got)
 	}
 }
+
+// TestSetAPIKeyLive (review): after SetAPIKey the next router call carries
+// the new key — the UI's Replace key needs no restart.
+func TestSetAPIKeyLive(t *testing.T) {
+	f := newFX(t)
+	var seen []string
+	f.fallback = func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		seen = append(seen, r.Header.Get("Authorization"))
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"router":true}` + "\n"))
+	}
+	f.start(false) // everything through the router
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	f.post(body)
+	f.proxy.SetAPIKey("rn_sk_FXNEWKEY")
+	f.post(body)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(seen) != 2 || seen[0] != "Bearer "+testAPIKey || seen[1] != "Bearer rn_sk_FXNEWKEY" {
+		t.Fatalf("Authorization headers = %q", seen)
+	}
+}

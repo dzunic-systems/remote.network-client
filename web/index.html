@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" class="rn-dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The serve process injects the per-process CSRF token here when it
+         serves this page (a plain build carries the placeholder, and the
+         UI treats an unreplaced placeholder as "no token" — everything
+         state-changing then answers 403). -->
+    <meta name="rc-csrf" content="__RC_CSRF__" />
+    <title>remote client</title>
+    <meta name="robots" content="noindex" />
+    <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -21,26 +21,24 @@ import (
 
 func newChatCommand() *cobra.Command {
 	var model, apiKey, apiKeyFile, keyFile, router string
-	var noDirect bool
+	var noDirect, webSearch bool
 	cmd := &cobra.Command{
 		Use:   "chat --model MODEL \"prompt\"",
 		Short: "One-shot completion over the same direct-or-fallback path as serve",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			s, err := config.Resolve(config.Flags{
+				Router: router, APIKey: apiKey, APIKeyFile: apiKeyFile,
+				NoDirect: noDirect, Model: model, WebSearch: webSearch,
+			})
 			if err != nil {
 				return err
 			}
-			if router == "" {
-				router = cfg.Router
-			}
-			direct := cfg.DirectOn() && !noDirect
-			apiKey, err = resolveKey(apiKey, apiKeyFile)
-			if err != nil {
-				return err
-			}
-			if apiKey == "" {
+			if s.APIKey.Value == "" {
 				return errors.New("an API key is required: --api-key-file, the file ~/.remote/client-api-key (run `remote-client login`), or REMOTE_API_KEY")
+			}
+			if s.DefaultModel.Value == "" {
+				return errors.New("a model is required: --model, REMOTE_DEFAULT_MODEL, or default_model in the config file")
 			}
 			if keyFile == "" {
 				keyFile, err = defaultIdentityKeyPath()
@@ -54,6 +52,7 @@ func newChatCommand() *cobra.Command {
 			}
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer stop()
+			direct := s.Direct.Value
 			var natSock *nat.Socket
 			if direct {
 				natSock, err = nat.Bind(nat.Config{})
@@ -62,16 +61,16 @@ func newChatCommand() *cobra.Command {
 				}
 				defer natSock.Close()
 				hc := &http.Client{Timeout: 30 * time.Second}
-				urls := []string{cfg.Router}
-				if cfg.RouterAlt != "" {
-					urls = append(urls, cfg.RouterAlt)
+				urls := []string{s.Router.Value}
+				if s.RouterAlt.Value != "" {
+					urls = append(urls, s.RouterAlt.Value)
 				}
 				go natSock.Run(ctx, func(rctx context.Context) ([]nat.RouterEndpoints, error) {
 					return directInfoEndpoints(rctx, hc, urls)
 				})
 			}
 			srv, err := proxy.New(proxy.Config{
-				Router: router, APIKey: apiKey, ClientKey: clientKey,
+				Router: s.Router.Value, APIKey: s.APIKey.Value, ClientKey: clientKey,
 				NAT: natSock, Direct: direct, Version: Version,
 			})
 			if err != nil {
@@ -86,11 +85,15 @@ func newChatCommand() *cobra.Command {
 				}
 				prompt += a
 			}
-			body, _ := json.Marshal(map[string]any{
-				"model":    model,
+			body := map[string]any{
+				"model":    s.DefaultModel.Value,
 				"messages": []map[string]any{{"role": "user", "content": prompt}},
-			})
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://local/v1/chat/completions", bytes.NewReader(body))
+			}
+			if s.WebSearch.Value {
+				body["web_search"] = true
+			}
+			b, _ := json.Marshal(body)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1/v1/chat/completions", bytes.NewReader(b))
 			if err != nil {
 				return err
 			}
@@ -102,13 +105,13 @@ func newChatCommand() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&model, "model", "", "the model to ask for (required)")
-	_ = cmd.MarkFlagRequired("model")
-	cmd.Flags().StringVar(&router, "router", os.Getenv("REMOTE_ROUTER"), "router base URL (default: config file, env REMOTE_ROUTER, or the public router)")
+	cmd.Flags().StringVar(&model, "model", "", "the model to ask for (default: config file default_model, env REMOTE_DEFAULT_MODEL)")
+	cmd.Flags().StringVar(&router, "router", "", "router base URL (default: config file, env REMOTE_ROUTER, or the public router)")
 	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key (env REMOTE_API_KEY; prefer the key file)")
 	cmd.Flags().StringVar(&apiKeyFile, "api-key-file", "", "file holding the API key (default ~/.remote/client-api-key)")
 	cmd.Flags().StringVar(&keyFile, "key-file", "", "this client's identity key (default ~/.remote/client.key)")
 	cmd.Flags().BoolVar(&noDirect, "no-direct", false, "send everything through the router")
+	cmd.Flags().BoolVar(&webSearch, "web-search", false, "ground the answer in a router-run web search")
 	return cmd
 }
 

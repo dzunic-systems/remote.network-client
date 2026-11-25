@@ -39,6 +39,11 @@ and check it against `checksums.txt`.
    # OPENAI_BASE_URL=http://127.0.0.1:4141/v1, any API key value
    ```
 
+   A small web UI comes with it: open http://127.0.0.1:4141/ui/ for
+   chat with the network's models, every setting with the source it
+   resolved from, a key replacement, and the same check `doctor` runs.
+   Turn it off with `--no-ui`.
+
 Other commands:
 
 | Command | What it does |
@@ -46,7 +51,41 @@ Other commands:
 | `remote-client chat --model MODEL "prompt"` | One completion over the same path as `serve` |
 | `remote-client doctor` | Can this machine reach a node directly? Sends no inference and costs nothing |
 | `remote-client serve --no-direct` | Everything through the router |
+| `remote-client config show` | Every setting with its effective value and its source |
+| `remote-client config set KEY VALUE` | Write one setting to the config file |
 | `remote-client version` | Print the version |
+
+## Settings
+
+Every setting resolves in the same order: **flag → environment → config
+file (`~/.remote/client.yaml`) → default**, and `config show` tells you
+which source won. A value from a flag or the environment is locked for
+that run — change the flag or the variable, not the file.
+
+| Setting | Flag | Environment | Config file key | Default |
+|---|---|---|---|---|
+| Router | `--router` | `REMOTE_ROUTER` | `router` | `https://spine.remote.network` |
+| Second router (NAT cross-check) | `--router-alt` | `REMOTE_ROUTER_ALT` | `router_alt` | — |
+| Listen address | `--listen` | `REMOTE_LISTEN` | `listen` | `127.0.0.1:4141` |
+| Listen port | `--port` | `REMOTE_PORT` | `port` | `4141` (kept on the listen host; conflicts with a `listen` value naming a different port are an error) |
+| API key | `--api-key` | `REMOTE_API_KEY` | — (never in the file) | the key file |
+| Key file | `--api-key-file` | `REMOTE_API_KEY_FILE` | `api_key_file` | `~/.remote/client-api-key` |
+| Direct path | `--no-direct` | `REMOTE_DIRECT` | `direct` | on |
+| Local token | `--local-token` | `REMOTE_LOCAL_TOKEN` | — (never in the file) | — |
+| Log level | `--verbose` (= debug) | `REMOTE_LOG_LEVEL` | `log_level` | `info` |
+| Web UI | `--no-ui` | `REMOTE_UI` | `ui` | on |
+| Default model | `--model` (`chat`) | `REMOTE_DEFAULT_MODEL` | `default_model` | — |
+| Web search (client chat) | `--web-search` (`chat`) | `REMOTE_WEB_SEARCH` | `web_search` | off |
+| MCP config | — | `REMOTE_MCP_CONFIG` | `mcp_config` | `~/.remote/mcp.json` |
+| Local tools | — | `REMOTE_TOOLS` | `tools` | on when an MCP config exists |
+| Everything's home | — | `REMOTE_HOME` | — | `~/.remote` |
+
+Booleans accept `1/0/true/false/on/off/yes/no`; anything else is a
+startup error that names the variable. The API key and the local token
+are secrets: they are never written to the config file, never logged,
+and shown only as "set" with their source (`config show`, the web UI).
+`REMOTE_HOME` moves the key, the config file, the identity key and the
+tool config together.
 
 ## How a request travels
 
@@ -70,6 +109,10 @@ Other commands:
 - Listening on any other address requires `--local-token SECRET`. Every
   caller must then send that secret as `Authorization: Bearer SECRET` or
   `X-Local-Token`.
+- The web UI under `/ui/` is covered by the same rules, and its
+  state-changing calls additionally carry a per-process CSRF token the
+  server bakes into the page. The API key never reaches the page: the
+  proxy adds it to router-bound requests itself.
 
 The node agent people run to *serve* models is a separate program:
 [dzunic-systems/remote.network](https://github.com/dzunic-systems/remote.network).

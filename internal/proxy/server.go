@@ -26,6 +26,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -84,11 +85,43 @@ type Server struct {
 	pool *conn.Pool
 	log  *slog.Logger
 
+	// key is the API key in use: cfg.APIKey at start, replaced live by
+	// SetAPIKey (the UI's Replace key) — no restart needed.
+	key atomic.Pointer[string]
+
 	sparesMu      sync.Mutex
 	spares        map[string]*spareEntry // (model, needs) → the held spare
 	spareFetching map[string]bool        // a spare fetch in flight, per key
 	// spareTTL overrides spareMaxAge (tests shrink it); 0 = the default.
 	spareTTL time.Duration
+}
+
+// APIKey is the key in use now (the UI's doctor check reads it).
+func (s *Server) APIKey() string { return s.apiKey() }
+
+// apiKey is the key every router call carries.
+func (s *Server) apiKey() string {
+	if k := s.key.Load(); k != nil {
+		return *k
+	}
+	return s.cfg.APIKey
+}
+
+// SetAPIKey switches the key for every later router call (the UI's
+// Replace key). A held spare's tickets were minted for the old key's
+// account; they are released so the next request routes with the new one.
+func (s *Server) SetAPIKey(k string) {
+	s.sparesMu.Lock()
+	held := make([]*spareEntry, 0, len(s.spares))
+	for _, sp := range s.spares {
+		held = append(held, sp)
+	}
+	s.spares = map[string]*spareEntry{}
+	s.sparesMu.Unlock()
+	for _, sp := range held {
+		s.releaseCandidates(sp.cands) // under the old key: its account owns them
+	}
+	s.key.Store(&k)
 }
 
 // ttl is this server's spare age bound.
@@ -127,7 +160,12 @@ type Config struct {
 	// HTTP is the router HTTP client (nil = defaultRouterClient: no
 	// overall timeout, transport-level phase timeouts).
 	HTTP *http.Client
-	Log  *slog.Logger
+	// UI, when set, serves the local web UI: the whole /ui prefix routes
+	// to it (the SPA at /ui/, the page's JSON API under /ui/api/), and
+	// GET / with an Accept for text/html redirects there. Never nil'd
+	// into a router forward: the UI is local only.
+	UI  http.Handler
+	Log *slog.Logger
 }
 
 // defaultRouterClient is the client for the surfaces that stream: no
@@ -307,18 +345,38 @@ func (s *Server) expireSpare(key string, sp *spareEntry) {
 // Handler is the local HTTP surface.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uiPath := r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/")
+		// The UI shell and its assets are public static files: a browser
+		// navigating to /ui/ cannot carry the local token header, so with
+		// a local token set the shell is served anyway and the page asks
+		// for the token once (sessionStorage). Everything under /ui/api/
+		// still requires it, like every other path.
+		uiShell := uiPath && !strings.HasPrefix(r.URL.Path, "/ui/api/")
 		if s.cfg.LocalToken == "" && !loopbackGate(r) {
 			s.apiError(w, http.StatusForbidden, "invalid_request_error", "loopback_only",
 				"the local endpoint accepts loopback requests only; run serve with --local-token to use it over the network")
 			return
 		}
-		if err := s.authorize(r); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"message":"invalid local token","type":"invalid_request_error","code":"invalid_local_token"}}` + "\n"))
-			return
+		if s.cfg.LocalToken != "" && !uiShell {
+			if err := s.authorize(r); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"message":"invalid local token","type":"invalid_request_error","code":"invalid_local_token"}}` + "\n"))
+				return
+			}
 		}
 		switch {
+		case uiPath:
+			if s.cfg.UI == nil {
+				s.apiError(w, http.StatusNotFound, "invalid_request_error", "", "the web UI is off (serve --no-ui, or ui: off)")
+				return
+			}
+			s.cfg.UI.ServeHTTP(w, r)
+		case r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.Contains(r.Header.Get("Accept"), "text/html"):
+			// A browser lands here; OpenAI SDKs (Accept: application/json)
+			// keep seeing the router's forward, as always.
+			http.Redirect(w, r, "/ui/", http.StatusFound)
 		case r.URL.Path == "/healthz":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true}` + "\n"))
@@ -622,7 +680,7 @@ func (s *Server) routeCall(ctx context.Context, ask []byte) (doc routeDoc, statu
 		return routeDoc{}, 0, nil, err
 	}
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
+	req2.Header.Set("Authorization", "Bearer "+s.apiKey()) // never in a URL, never logged
 	req2.Header.Set("X-Remote-Client", wireVersion(s.cfg.Version))
 	resp, err := s.hc.Do(req2)
 	if err != nil {
@@ -965,7 +1023,7 @@ func (s *Server) after(reqID string, cand routeCandidate, rd *render, status str
 			return
 		}
 		req2.Header.Set("Content-Type", "application/json")
-		req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+		req2.Header.Set("Authorization", "Bearer "+s.apiKey())
 		resp, err := s.hc.Do(req2)
 		if err != nil {
 			s.log.Debug("cross-check post failed", "ticket_id", cand.Ticket.ID, "err", err)
@@ -1000,6 +1058,7 @@ func (s *Server) releaseTickets(ids []string) {
 	if len(ids) > 8 {
 		ids = ids[:8] // the desk's per-call bound
 	}
+	key := s.apiKey() // the key that owns these tickets, read now
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -1013,7 +1072,7 @@ func (s *Server) releaseTickets(ids []string) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
+		req.Header.Set("Authorization", "Bearer "+key) // never in a URL, never logged
 		resp, err := s.hc.Do(req)
 		if err != nil {
 			s.log.Debug("release post failed", "tickets", len(ids), "err", err)
@@ -1040,7 +1099,7 @@ func (s *Server) fallback(w http.ResponseWriter, r *http.Request, body []byte) {
 		return
 	}
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	req2.Header.Set("Authorization", "Bearer "+s.apiKey())
 	for _, h := range []string{"X-Title", "HTTP-Referer"} {
 		if v := r.Header.Get(h); v != "" {
 			req2.Header.Set(h, v)
@@ -1096,7 +1155,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 			req2.Header.Set(h, v)
 		}
 	}
-	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	req2.Header.Set("Authorization", "Bearer "+s.apiKey())
 	resp, err := s.hc.Do(req2)
 	if err != nil {
 		s.apiError(w, http.StatusBadGateway, "api_error", "router_unreachable",

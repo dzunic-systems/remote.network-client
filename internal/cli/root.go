@@ -2,7 +2,8 @@
 //
 // `serve` is the local OpenAI-compatible endpoint (direct path when one
 // exists, the router otherwise); `chat` is the same path one-shot;
-// `doctor` checks reachability; `login` stores the API key.
+// `doctor` checks reachability; `login` stores the API key; `config`
+// shows and sets the settings.
 package cli
 
 import (
@@ -39,6 +40,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newServeCommand())
 	root.AddCommand(newChatCommand())
 	root.AddCommand(newDoctorCommand())
+	root.AddCommand(newConfigCommand())
 	return root
 }
 

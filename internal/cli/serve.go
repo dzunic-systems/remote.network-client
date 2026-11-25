@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,48 +14,45 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"remote.network/client/internal/config"
+	"remote.network/client/internal/doctor"
 	"remote.network/client/internal/nat"
 	"remote.network/client/internal/proxy"
+	"remote.network/client/internal/ui"
+	"remote.network/client/web"
 	"remote.network/node/identity"
 )
 
 func newServeCommand() *cobra.Command {
-	var router, listen, apiKey, apiKeyFile, localToken, keyFile, routerAlt string
-	var noDirect, verbose bool
+	var router, routerAlt, listen, apiKey, apiKeyFile, localToken, keyFile string
+	var port int
+	var noDirect, verbose, noUI bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the local OpenAI-compatible endpoint (http://127.0.0.1:4141/v1)",
 		Long: "serve runs a local OpenAI-compatible endpoint. Each chat request goes straight\n" +
 			"to a serving node over QUIC when a direct path exists, and through a router\n" +
 			"otherwise. Point any OpenAI-compatible tool at http://127.0.0.1:4141/v1.\n" +
-			"Needs an API key: --api-key-file, ~/.remote/client-api-key (see `login`), or\n" +
-			"REMOTE_API_KEY.",
+			"A small web UI lives at http://127.0.0.1:4141/ui/ (chat, settings, a doctor\n" +
+			"check). Needs an API key: --api-key-file, ~/.remote/client-api-key (see\n" +
+			"`login`), or REMOTE_API_KEY.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load()
+			fl := config.Flags{
+				Router: router, RouterAlt: routerAlt, Listen: listen, Port: port,
+				APIKey: apiKey, APIKeyFile: apiKeyFile, NoDirect: noDirect,
+				LocalToken: localToken, Verbose: verbose, NoUI: noUI,
+			}
+			s, err := config.Resolve(fl)
 			if err != nil {
 				return err
 			}
-			if router == "" {
-				router = cfg.Router
-			}
-			if routerAlt == "" {
-				routerAlt = cfg.RouterAlt
-			}
-			if listen == "" {
-				listen = cfg.Listen
-			}
-			direct := cfg.DirectOn() && !noDirect
-			apiKey, err = resolveKey(apiKey, apiKeyFile)
-			if err != nil {
-				return err
-			}
-			if apiKey == "" {
+			if s.APIKey.Value == "" {
 				return errors.New("an API key is required: --api-key-file, the file ~/.remote/client-api-key (run `remote-client login`), or REMOTE_API_KEY")
 			}
 			if keyFile == "" {
@@ -69,17 +67,18 @@ func newServeCommand() *cobra.Command {
 			}
 			// A non-loopback listener exposes the endpoint to the network:
 			// it needs a local token, compared per request.
-			loop, err := isLoopbackListen(listen)
+			loop, err := isLoopbackListen(s.Listen.Value)
 			if err != nil {
-				return fmt.Errorf("--listen %s: %w", listen, err)
+				return fmt.Errorf("--listen %s: %w", s.Listen.Value, err)
 			}
-			if !loop && localToken == "" {
+			if !loop && s.LocalToken.Value == "" {
 				return errors.New("listening on a non-loopback address requires --local-token (anyone who can reach the port would use your credits)")
 			}
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
+			direct := s.Direct.Value
 			var natSock *nat.Socket
 			if direct {
 				natSock, err = nat.Bind(nat.Config{})
@@ -88,27 +87,62 @@ func newServeCommand() *cobra.Command {
 				}
 				defer natSock.Close()
 				hc := &http.Client{Timeout: 15 * time.Second}
-				urls := []string{router}
-				if routerAlt != "" {
-					urls = append(urls, routerAlt)
+				urls := []string{s.Router.Value}
+				if s.RouterAlt.Value != "" {
+					urls = append(urls, s.RouterAlt.Value)
 				}
 				go natSock.Run(ctx, func(rctx context.Context) ([]nat.RouterEndpoints, error) {
 					return directInfoEndpoints(rctx, hc, urls)
 				})
 			}
+
+			// The web UI: settings (with their sources), Replace key, and
+			// the doctor check — all backed by this run's resolution, so a
+			// flag-locked setting shows as locked here too.
+			var uiHandler http.Handler
+			var srvRef atomic.Pointer[proxy.Server] // set once the proxy exists; the UI's key hand-off
+			curKey := func() string {
+				if p := srvRef.Load(); p != nil {
+					return p.APIKey()
+				}
+				return s.APIKey.Value
+			}
+			if s.UI.Value {
+				uiHandler = ui.New(ui.Config{
+					Dist:     web.Dist(),
+					Settings: func() (config.Settings, error) { return config.Resolve(fl) },
+					KeyFile:  s.APIKeyFile.Value,
+					OnKey: func(k string) {
+						if p := srvRef.Load(); p != nil {
+							p.SetAPIKey(k)
+						}
+					},
+					Doctor: func(rctx context.Context) (string, bool) {
+						var buf bytes.Buffer
+						res, derr := doctor.Run(rctx, doctor.Options{
+							Router: s.Router.Value, APIKey: curKey(),
+							ClientKey: clientKey, Version: Version,
+						}, &buf)
+						_ = res
+						return buf.String(), derr == nil
+					},
+				})
+			}
+
 			srv, err := proxy.New(proxy.Config{
-				Router: router, APIKey: apiKey, LocalToken: localToken,
+				Router: s.Router.Value, APIKey: s.APIKey.Value, LocalToken: s.LocalToken.Value,
 				ClientKey: clientKey, NAT: natSock, Direct: direct,
-				Version: Version,
-				Log:     slog.New(slog.NewTextHandler(os.Stderr, logOpts(verbose))),
+				Version: Version, UI: uiHandler,
+				Log: slog.New(slog.NewTextHandler(os.Stderr, logOpts(s.LogLevel.Value))),
 			})
 			if err != nil {
 				return err
 			}
+			srvRef.Store(srv)
 			defer srv.Close()
 
 			httpSrv := &http.Server{
-				Addr:              listen,
+				Addr:              s.Listen.Value,
 				Handler:           srv.Handler(),
 				ReadHeaderTimeout: 10 * time.Second,
 			}
@@ -116,8 +150,11 @@ func newServeCommand() *cobra.Command {
 			if direct {
 				mode = "on"
 			}
-			cmd.Printf("remote-client %s listening on http://%s (direct path: %s)\n", Version, listen, mode)
-			cmd.Printf("point your OpenAI-compatible tool at http://%s/v1\n", listen)
+			cmd.Printf("remote-client %s listening on http://%s (direct path: %s)\n", Version, s.Listen.Value, mode)
+			cmd.Printf("point your OpenAI-compatible tool at http://%s/v1\n", s.Listen.Value)
+			if s.UI.Value {
+				cmd.Printf("the web UI is at http://%s/ui/\n", s.Listen.Value)
+			}
 			errCh := make(chan error, 1)
 			go func() {
 				if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -132,32 +169,18 @@ func newServeCommand() *cobra.Command {
 			}
 		},
 	}
-	def := os.Getenv("REMOTE_ROUTER")
-	if def == "" {
-		def = ""
-	}
-	cmd.Flags().StringVar(&router, "router", def, "router base URL (default: config file, env REMOTE_ROUTER, or the public router)")
+	cmd.Flags().StringVar(&router, "router", "", "router base URL (default: config file, env REMOTE_ROUTER, or the public router)")
 	cmd.Flags().StringVar(&routerAlt, "router-alt", "", "a second router's base URL — strengthens the NAT test")
 	cmd.Flags().StringVar(&listen, "listen", "", "local listen address (default 127.0.0.1:4141)")
+	cmd.Flags().IntVar(&port, "port", 0, "local listen port, kept on the listen host (default 4141; env REMOTE_PORT)")
 	cmd.Flags().StringVar(&apiKey, "api-key", "", "API key (env REMOTE_API_KEY; prefer the key file)")
 	cmd.Flags().StringVar(&apiKeyFile, "api-key-file", "", "file holding the API key (default ~/.remote/client-api-key)")
 	cmd.Flags().StringVar(&localToken, "local-token", "", "secret clients must present when the listener is not loopback-only")
 	cmd.Flags().StringVar(&keyFile, "key-file", "", "this client's identity key (default ~/.remote/client.key)")
 	cmd.Flags().BoolVar(&noDirect, "no-direct", false, "send everything through the router")
+	cmd.Flags().BoolVar(&noUI, "no-ui", false, "do not serve the web UI at /ui/")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "log why each direct attempt was refused or fell back (never logs the key or prompts)")
 	return cmd
-}
-
-// resolveKey applies the key sources in order: the flag, the named file,
-// the default file, the environment. The key is never printed.
-func resolveKey(flagVal, fileFlag string) (string, error) {
-	if flagVal != "" {
-		return flagVal, nil
-	}
-	if k, err := config.ReadKeyFile(fileFlag); err != nil || k != "" {
-		return k, err
-	}
-	return os.Getenv("REMOTE_API_KEY"), nil
 }
 
 func defaultIdentityKeyPath() (string, error) {
@@ -237,12 +260,16 @@ func directInfoEndpoints(ctx context.Context, hc *http.Client, urls []string) ([
 	return out, nil
 }
 
-// logOpts is the serve log level: --verbose adds the per-candidate
-// decisions (dial failures, pre-token refusals and their codes, route
-// fallbacks).
-func logOpts(verbose bool) *slog.HandlerOptions {
-	if verbose {
+// logOpts is the serve log level (log_level: debug|info|warn; --verbose
+// means debug): debug adds the per-candidate decisions (dial failures,
+// pre-token refusals and their codes, route fallbacks).
+func logOpts(level string) *slog.HandlerOptions {
+	switch level {
+	case "debug":
 		return &slog.HandlerOptions{Level: slog.LevelDebug}
+	case "warn":
+		return &slog.HandlerOptions{Level: slog.LevelWarn}
+	default:
+		return nil
 	}
-	return nil
 }

@@ -73,7 +73,9 @@ func TestSetPersistsAndReloads0600(t *testing.T) {
 	if err := s2.Set("fx__slow", Deny); err != nil {
 		t.Fatal(err)
 	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits (the user-profile ACL protects
+	// the file), so the tightening is checked elsewhere only.
+	if fi, _ := os.Stat(path); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("loose file not tightened: %o", fi.Mode().Perm())
 	}
 }

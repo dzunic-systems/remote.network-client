@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +30,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	fakeMCPBin = filepath.Join(dir, "fakemcp")
+	if runtime.GOOS == "windows" {
+		fakeMCPBin += ".exe" // exec runs only named executables there
+	}
 	cmd := exec.Command("go", "build", "-o", fakeMCPBin, "../tools/testdata/fakemcp")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		panic("building the fake MCP server failed: " + string(out))
@@ -138,7 +143,7 @@ func TestUIChatToolTurnPermissionFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "mcp.json"),
-		[]byte(`{"mcpServers":{"fx":{"command":"`+fakeMCPBin+`"}}}`), 0o600); err != nil {
+		[]byte(`{"mcpServers":{"fx":{"command":`+strconv.Quote(fakeMCPBin)+`}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := tools.LoadConfig(filepath.Join(dir, "mcp.json"))

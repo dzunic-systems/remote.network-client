@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	fakeBin = filepath.Join(dir, "fakemcp")
+	if runtime.GOOS == "windows" {
+		fakeBin += ".exe" // exec runs only named executables there
+	}
 	// The test binary's CWD is this package's dir; testdata is excluded
 	// from ./... traversal but builds fine when named directly.
 	cmd := exec.Command("go", "build", "-o", fakeBin, "./testdata/fakemcp")
@@ -87,7 +92,7 @@ func TestLoadConfig(t *testing.T) {
 func newRegistry(t *testing.T) *Registry {
 	t.Helper()
 	_, dir := testConfig(t)
-	path := writeMCP(t, dir, `{"mcpServers":{"fx":{"command":"`+fakeBin+`"}}}`)
+	path := writeMCP(t, dir, `{"mcpServers":{"fx":{"command":`+strconv.Quote(fakeBin)+`}}}`)
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)

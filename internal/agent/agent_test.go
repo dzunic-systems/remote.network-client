@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	fakeBin = filepath.Join(dir, "fakemcp")
+	if runtime.GOOS == "windows" {
+		fakeBin += ".exe" // exec runs only named executables there
+	}
 	cmd := exec.Command("go", "build", "-o", fakeBin, "../tools/testdata/fakemcp")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		panic("building the fake MCP server failed: " + string(out))
@@ -136,7 +141,7 @@ func newHarness(t *testing.T, scripts ...proxyScript) *harness {
 		t.Fatal(err)
 	}
 	mcpPath := filepath.Join(dir, "mcp.json")
-	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{"fx":{"command":"`+fakeBin+`"}}}`), 0o600); err != nil {
+	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{"fx":{"command":`+strconv.Quote(fakeBin)+`}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := tools.LoadConfig(mcpPath)

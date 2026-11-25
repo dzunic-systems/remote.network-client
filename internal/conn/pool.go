@@ -109,6 +109,46 @@ func (p *Pool) Get(ctx context.Context, nodeID, nodePub string, endpoints []stri
 	return c, nil
 }
 
+// Has reports whether the pool holds a connection to the node pinned to
+// that key. A held spare uses it: a spare is up to a minute old, and a
+// node behind NAT is reachable only while the punch its offer opened
+// still holds — a live pooled connection is the proof that it does.
+func (p *Pool) Has(nodeID, nodePub string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.conns[nodeID]
+	return e != nil && e.pub == nodePub
+}
+
+// Unreachable returns the node ids currently in a fail cooldown — the
+// route request's "unreachable" report (phase 3 follow-up A1): the router
+// mints no ticket for a node this machine cannot dial, so no candidate is
+// born dead. The cooldown key is node id plus endpoints; only the node id
+// is reported (once, however many endpoint sets cooled down). Expired
+// entries are dropped here, never reported.
+func (p *Pool) Unreachable() []string {
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	seen := map[string]bool{}
+	for k, until := range p.failed {
+		if now.After(until) {
+			delete(p.failed, k)
+			continue
+		}
+		id := k
+		if i := strings.IndexByte(k, '|'); i >= 0 { // the key is id + "|" + endpoints
+			id = k[:i]
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // ForgetFailures clears every cooldown: this machine's network changed,
 // so what it could not reach before may be reachable now.
 func (p *Pool) ForgetFailures() {

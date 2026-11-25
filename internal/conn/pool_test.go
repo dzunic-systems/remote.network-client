@@ -58,3 +58,37 @@ func TestFailCooldown(t *testing.T) {
 		t.Fatal("cooldown outlived FailCooldown")
 	}
 }
+
+// TestUnreachableReport (A1): the route request's report — one entry per
+// cooled-down node id (however many endpoint sets are cooling), expired
+// entries dropped, none when the pool is clean.
+func TestUnreachableReport(t *testing.T) {
+	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &quic.Transport{Conn: sock}
+	defer tr.Close()
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	p := New(tr, key)
+	defer p.Close()
+	now := time.Now()
+	p.now = func() time.Time { return now }
+
+	if ids := p.Unreachable(); len(ids) != 0 {
+		t.Fatalf("clean pool reported %v", ids)
+	}
+	p.mu.Lock()
+	p.failed["n1|127.0.0.1:1"] = now.Add(FailCooldown)
+	p.failed["n1|10.0.0.1:1"] = now.Add(FailCooldown) // same node, another endpoint set
+	p.failed["n2|127.0.0.1:2"] = now.Add(FailCooldown)
+	p.failed["n3|127.0.0.1:3"] = now.Add(-time.Second) // already expired
+	p.mu.Unlock()
+	got := map[string]bool{}
+	for _, id := range p.Unreachable() {
+		got[id] = true
+	}
+	if len(got) != 2 || !got["n1"] || !got["n2"] {
+		t.Fatalf("unreachable = %v, want n1 (deduped) + n2, no expired n3", got)
+	}
+}

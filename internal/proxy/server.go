@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -47,12 +48,55 @@ const routeCandidates = 3
 // routeTimeout bounds the /direct/route round trip.
 const routeTimeout = 10 * time.Second
 
+// spareMaxAge is how long a held spare stays usable: at fetch + 60 s,
+// at least 60 s of the 120 s ticket lifetime remains. Past it the spare
+// is released and held no longer (no keep-alive refetch loop for an idle
+// client).
+const spareMaxAge = 60 * time.Second
+
+// spareDefaultMaxTokens mirrors the desk's directDefaultMaxTokens: the
+// output cap a request with no max_tokens asks for, and so the cap a
+// spare must cover when the next request states no budget.
+const spareDefaultMaxTokens = 4096
+
+// spareEntry is one held spare: the route answer's candidates (each with
+// its signed ticket), when they were fetched, and the public address
+// this machine answered at — a network change voids them.
+type spareEntry struct {
+	cands     []routeCandidate
+	fetchedAt time.Time
+	pub       string
+}
+
+// spareKeyOf is the spare slot's identity: model plus needs (B1). The
+// conversation is deliberately NOT part of it — the node never checks a
+// ticket's ConvKey against the request (B3: the field lives on the ticket
+// for the router's affinity ranking alone), so a spare minted on one
+// conversation's request may serve another's.
+func spareKeyOf(req *clientproto.ChatRequest) string {
+	return fmt.Sprintf("%s|%t|%t", req.Model, len(req.Tools) > 0, hasVision(req))
+}
+
 // Server is the local endpoint.
 type Server struct {
 	cfg  Config
 	hc   *http.Client
 	pool *conn.Pool
 	log  *slog.Logger
+
+	sparesMu      sync.Mutex
+	spares        map[string]*spareEntry // (model, needs) → the held spare
+	spareFetching map[string]bool        // a spare fetch in flight, per key
+	// spareTTL overrides spareMaxAge (tests shrink it); 0 = the default.
+	spareTTL time.Duration
+}
+
+// ttl is this server's spare age bound.
+func (s *Server) ttl() time.Duration {
+	if s.spareTTL > 0 {
+		return s.spareTTL
+	}
+	return spareMaxAge
 }
 
 // Config builds a Server.
@@ -112,9 +156,11 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("proxy: the direct path needs a NAT socket")
 	}
 	s := &Server{
-		cfg: cfg,
-		hc:  cfg.HTTP,
-		log: cfg.Log.With("component", "proxy"),
+		cfg:           cfg,
+		hc:            cfg.HTTP,
+		log:           cfg.Log.With("component", "proxy"),
+		spares:        map[string]*spareEntry{},
+		spareFetching: map[string]bool{},
 	}
 	if cfg.NAT != nil {
 		s.pool = conn.New(cfg.NAT.Transport(), cfg.ClientKey)
@@ -122,8 +168,141 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Close shuts the pool down.
-func (s *Server) Close() { s.pool.Close() }
+// Close shuts the pool down (nil when the direct path is off) and
+// releases any spare still held.
+func (s *Server) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
+	s.sparesMu.Lock()
+	held := make([]*spareEntry, 0, len(s.spares))
+	for _, sp := range s.spares {
+		held = append(held, sp)
+	}
+	s.spares = map[string]*spareEntry{}
+	s.sparesMu.Unlock()
+	for _, sp := range held {
+		s.releaseCandidates(sp.cands)
+	}
+}
+
+// takeSpare pops the (model, needs) spare when it is still good for this
+// request (B1): younger than spareMaxAge, this machine still at the
+// public address it was fetched at, and the ticket's output cap covers
+// the ask (the request's max_tokens, else the desk's default). Anything
+// else discards the spare — released (A2) — and the request takes the
+// normal route. A used spare frees this slot: the next spare is fetched
+// when this request completes.
+func (s *Server) takeSpare(req *clientproto.ChatRequest) []routeCandidate {
+	key := spareKeyOf(req)
+	s.sparesMu.Lock()
+	sp := s.spares[key]
+	delete(s.spares, key)
+	s.sparesMu.Unlock()
+	if sp == nil || len(sp.cands) == 0 {
+		return nil
+	}
+	drop := func(why string) []routeCandidate {
+		s.log.Debug("spare discarded — released", "why", why)
+		s.releaseCandidates(sp.cands)
+		return nil
+	}
+	if age := time.Since(sp.fetchedAt); age >= s.ttl() {
+		return drop("too old")
+	}
+	if info := s.cfg.NAT.Info(); info.Public == "" || info.Public != sp.pub {
+		return drop("public address changed")
+	}
+	ask := req.MaxTokens
+	if ask <= 0 {
+		ask = spareDefaultMaxTokens
+	}
+	if ask > sp.cands[0].Ticket.MaxTokens {
+		return drop("output cap too small")
+	}
+	// Only candidates this machine still holds a connection to. The punch
+	// a spare's offer opened at fetch time may have lapsed in the node's
+	// NAT since; dialing then fails, and the failure would cool a node
+	// down that a fresh route (a fresh punch) reaches fine.
+	var live, stale []routeCandidate
+	for _, c := range sp.cands {
+		if s.pool.Has(c.NodeID, c.NodePub) {
+			live = append(live, c)
+		} else {
+			stale = append(stale, c)
+		}
+	}
+	s.releaseCandidates(stale)
+	if len(live) == 0 {
+		s.log.Debug("spare discarded — released", "why", "no live connection to its nodes")
+		return nil
+	}
+	return live
+}
+
+// maybeFetchSpare arms the background fetch of ONE spare route for this
+// request's (model, needs) (B1): after a direct request completes, the
+// next one should skip the desk round trip. At most one spare per key,
+// at most one fetch in flight per key. No answer → no spare, and the
+// next completion simply asks again.
+func (s *Server) maybeFetchSpare(req *clientproto.ChatRequest) {
+	key := spareKeyOf(req)
+	s.sparesMu.Lock()
+	if s.spares[key] != nil || s.spareFetching[key] {
+		s.sparesMu.Unlock()
+		return
+	}
+	s.spareFetching[key] = true
+	s.sparesMu.Unlock()
+	go func() {
+		defer func() {
+			s.sparesMu.Lock()
+			delete(s.spareFetching, key)
+			s.sparesMu.Unlock()
+		}()
+		s.fetchSpare(req, key)
+	}()
+}
+
+// fetchSpare asks the desk for the spare in the background and holds it.
+func (s *Server) fetchSpare(req *clientproto.ChatRequest, key string) {
+	ask, ok := s.routeAsk(req, true)
+	if !ok {
+		return // no observed public path: nothing to hold
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), routeTimeout)
+	defer cancel()
+	doc, status, _, err := s.routeCall(ctx, ask)
+	if err != nil || status != http.StatusOK || !doc.Direct || len(doc.Candidates) == 0 {
+		// disabled, no node, spare_refused (the cap is full), too old —
+		// all the same to a spare: none is held.
+		s.log.Debug("spare fetch answered nothing", "status", status, "reason", doc.Reason, "err", err)
+		return
+	}
+	sp := &spareEntry{cands: doc.Candidates, fetchedAt: time.Now(), pub: s.cfg.NAT.Info().Public}
+	s.sparesMu.Lock()
+	old := s.spares[key]
+	s.spares[key] = sp
+	s.sparesMu.Unlock()
+	if old != nil {
+		s.releaseCandidates(old.cands)
+	}
+	time.AfterFunc(s.ttl(), func() { s.expireSpare(key, sp) })
+}
+
+// expireSpare is the spare's alarm: release it and hold nothing — the
+// reservation must not idle past half the ticket lifetime, and an idle
+// client does not refetch.
+func (s *Server) expireSpare(key string, sp *spareEntry) {
+	s.sparesMu.Lock()
+	if s.spares[key] != sp {
+		s.sparesMu.Unlock()
+		return // used, replaced, or closed already
+	}
+	delete(s.spares, key)
+	s.sparesMu.Unlock()
+	s.releaseCandidates(sp.cands)
+}
 
 // Handler is the local HTTP surface.
 func (s *Server) Handler() http.Handler {
@@ -267,27 +446,68 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	s.fallback(w, r, body)
 }
 
-// tryDirect runs the route → candidates loop. true = the response was
-// written (or the consumer is gone writing it); false = fall back.
+// tryDirect runs the spare → route → candidates loop. true = the response
+// was written (or the consumer is gone writing it); false = fall back.
 func (s *Server) tryDirect(w http.ResponseWriter, r *http.Request, body []byte, req *clientproto.ChatRequest) bool {
-	cands, state := s.route(w, r, req)
-	switch state {
-	case routeSurfaced:
-		return true // the desk's admission error IS the response
-	case routeFallback:
-		return false
-	}
-	for _, cand := range cands {
-		switch s.tryCandidate(w, r, req, cand) {
-		case outcomeDone, outcomeCommitted:
-			return true
-		case outcomeRefused:
-			continue
-		case outcomeRouter:
+	// A held spare (B1) answers without the desk round trip — the field
+	// test's 450 ms of TTFT. A stale or mismatched spare is released and
+	// the normal route follows.
+	cands := s.takeSpare(req)
+	fromSpare := cands != nil
+	if !fromSpare {
+		var state routeState
+		cands, state = s.route(w, r, req)
+		switch state {
+		case routeSurfaced:
+			return true // the desk's admission error IS the response
+		case routeFallback:
 			return false
 		}
 	}
-	return false // every candidate refused pre-token: the router answers
+	done, handled := s.runCandidates(w, r, req, cands)
+	if handled || !fromSpare {
+		return done
+	}
+	// Every spare candidate refused pre-token: the spare saved a round
+	// trip it could not use. A fresh route (fresh candidates, a fresh
+	// punch) comes before the router.
+	cands, state := s.route(w, r, req)
+	switch state {
+	case routeSurfaced:
+		return true
+	case routeFallback:
+		return false
+	}
+	done, _ = s.runCandidates(w, r, req, cands)
+	return done
+}
+
+// runCandidates tries each candidate in turn. done is tryDirect's answer;
+// handled=false means every candidate refused pre-token (a fresh route
+// may still answer), handled=true that the request is answered or must go
+// to the router (an overflow).
+func (s *Server) runCandidates(w http.ResponseWriter, r *http.Request, req *clientproto.ChatRequest, cands []routeCandidate) (done, handled bool) {
+	for i, cand := range cands {
+		switch s.tryCandidate(w, r, req, cand) {
+		case outcomeDone, outcomeCommitted:
+			// The request is over: the candidates it did not use stop
+			// holding their reservations now (A2 release), not at expiry.
+			// A receipt arriving later still bills (F9) — release is not
+			// a cancellation of work already served. A spare was used or
+			// the desk answered: fetch the next one in the background.
+			s.releaseCandidates(append(append([]routeCandidate{}, cands[:i]...), cands[i+1:]...))
+			s.maybeFetchSpare(req)
+			return true, true
+		case outcomeRefused:
+			continue
+		case outcomeRouter:
+			s.releaseCandidates(cands) // this one overflowed; the rest never asked
+			return false, true
+		}
+	}
+	// Every candidate refused pre-token.
+	s.releaseCandidates(cands)
+	return false, false
 }
 
 // routeState is the desk call's verdict.
@@ -314,16 +534,15 @@ type routeCandidate struct {
 	Ticket              clientproto.Ticket `json:"ticket"`
 }
 
-// route asks the desk. A non-200 is surfaced verbatim (the desk runs the
-// same admission the router's chat does — the error the client would get
-// from the fallback, one round trip earlier). direct:false →
-// routeFallback.
-func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.ChatRequest) ([]routeCandidate, routeState) {
+// routeAsk builds the desk request: one shape for a live request and for
+// a background spare fetch (phase 3 follow-up B1). ok=false — no observed
+// public path yet — means nothing to name and nothing to hold.
+func (s *Server) routeAsk(req *clientproto.ChatRequest, spare bool) ([]byte, bool) {
 	info := s.cfg.NAT.Info()
 	if info.Public == "" {
-		return nil, routeFallback // no observed path yet: nothing to name
+		return nil, false
 	}
-	ask, err := json.Marshal(map[string]any{
+	ask := map[string]any{
 		"model":             req.Model,
 		"conv_hash":         clientproto.ConvHash(req.Messages),
 		"max_tokens":        req.MaxTokens,
@@ -336,51 +555,83 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.
 		"client_nat":   info.NAT,
 		"client_addrs": info.Addrs,
 		"n":            routeCandidates,
-	})
+	}
+	// A1: the nodes this machine is cooling down (a failed dial). The
+	// router mints no ticket for them, so no candidate is born dead.
+	if ids := s.pool.Unreachable(); len(ids) > 0 {
+		ask["unreachable"] = ids
+	}
+	if spare {
+		ask["spare"] = true
+	}
+	b, err := json.Marshal(ask)
 	if err != nil {
-		return nil, routeFallback
+		return nil, false
+	}
+	return b, true
+}
+
+// route asks the desk. A non-200 is surfaced verbatim (the desk runs the
+// same admission the router's chat does — the error the client would get
+// from the fallback, one round trip earlier). direct:false →
+// routeFallback.
+func (s *Server) route(w http.ResponseWriter, r *http.Request, req *clientproto.ChatRequest) ([]routeCandidate, routeState) {
+	ask, ok := s.routeAsk(req, false)
+	if !ok {
+		return nil, routeFallback // no observed path yet: nothing to name
 	}
 	rctx, cancel := context.WithTimeout(r.Context(), routeTimeout)
 	defer cancel()
-	req2, err := http.NewRequestWithContext(rctx, http.MethodPost,
-		strings.TrimSuffix(s.cfg.Router, "/")+"/api/v1/direct/route", bytes.NewReader(ask))
-	if err != nil {
-		return nil, routeFallback
-	}
-	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
-	req2.Header.Set("X-Remote-Client", wireVersion(s.cfg.Version))
-	resp, err := s.hc.Do(req2)
+	doc, status, b, err := s.routeCall(rctx, ask)
 	if err != nil {
 		s.log.Debug("route failed — falling back", "err", err)
 		return nil, routeFallback
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		// The router saw this machine at another public address than the
 		// last observation named: the network changed (a VPN went up or
 		// down). That is the desk's refusal, not the request's — recheck
 		// now and send this one through the router.
-		if resp.StatusCode == http.StatusBadRequest && apiErrorCode(b) == "client_addr_mismatch" {
+		if status == http.StatusBadRequest && apiErrorCode(b) == "client_addr_mismatch" {
 			s.log.Debug("public address changed — rechecking, this request goes through the router")
 			s.cfg.NAT.Recheck()
 			s.pool.ForgetFailures()
 			return nil, routeFallback
 		}
 		// Admission (402/403/…): the same answer the fallback would get.
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		w.WriteHeader(resp.StatusCode)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
 		_, _ = w.Write(b)
-		s.logRequest("fallback", "", 0, 0, 0, resp.StatusCode)
+		s.logRequest("fallback", "", 0, 0, 0, status)
 		return nil, routeSurfaced
 	}
-	var doc routeDoc
-	if json.Unmarshal(b, &doc) != nil || !doc.Direct || len(doc.Candidates) == 0 {
+	if !doc.Direct || len(doc.Candidates) == 0 {
 		s.log.Debug("no direct route — falling back", "reason", doc.Reason)
 		return nil, routeFallback // disabled, no direct node, client too old
 	}
 	return doc.Candidates, routeOK
+}
+
+// routeCall is the desk round trip shared by the live route and the
+// background spare fetch: the ask, authed, version-stamped; the response
+// body capped at 1 MiB.
+func (s *Server) routeCall(ctx context.Context, ask []byte) (doc routeDoc, status int, body []byte, err error) {
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimSuffix(s.cfg.Router, "/")+"/api/v1/direct/route", bytes.NewReader(ask))
+	if err != nil {
+		return routeDoc{}, 0, nil, err
+	}
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
+	req2.Header.Set("X-Remote-Client", wireVersion(s.cfg.Version))
+	resp, err := s.hc.Do(req2)
+	if err != nil {
+		return routeDoc{}, 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = json.Unmarshal(b, &doc) // a bad body with a bad status is the caller's problem
+	return doc, resp.StatusCode, b, nil
 }
 
 // outcome is one candidate's attempt result.
@@ -721,6 +972,60 @@ func (s *Server) after(reqID string, cand routeCandidate, rd *render, status str
 			return
 		}
 		resp.Body.Close()
+	}()
+}
+
+// releaseCandidates tells the router which candidate tickets this request
+// never used (phase 3 follow-up A2): their reservations free at once
+// instead of at expiry, and the node's pending count drops instead of
+// aging out over ten seconds.
+func (s *Server) releaseCandidates(cands []routeCandidate) {
+	ids := make([]string, 0, len(cands))
+	for _, c := range cands {
+		if c.Ticket.ID != "" {
+			ids = append(ids, c.Ticket.ID)
+		}
+	}
+	s.releaseTickets(ids)
+}
+
+// releaseTickets posts the release fire-and-forget with a 3 s timeout.
+// A 404 is an old router without the surface: dropped silently. Anything
+// else is a log line — the reservation frees at expiry regardless, so no
+// retry loop.
+func (s *Server) releaseTickets(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	if len(ids) > 8 {
+		ids = ids[:8] // the desk's per-call bound
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		b, err := json.Marshal(map[string]any{"ticket_ids": ids})
+		if err != nil {
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			strings.TrimSuffix(s.cfg.Router, "/")+"/api/v1/direct/release", bytes.NewReader(b))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey) // never in a URL, never logged
+		resp, err := s.hc.Do(req)
+		if err != nil {
+			s.log.Debug("release post failed", "tickets", len(ids), "err", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return // an old router: no release surface yet
+		}
+		if resp.StatusCode != http.StatusOK {
+			s.log.Debug("release not taken", "tickets", len(ids), "status", resp.StatusCode)
+		}
 	}()
 }
 

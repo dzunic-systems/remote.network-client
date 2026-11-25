@@ -77,8 +77,12 @@ type fx struct {
 
 	mu           sync.Mutex
 	receiptPosts []map[string]any
+	releasePosts []map[string]any
 	routeReqs    []map[string]any
 	fallbacks    int
+	// releaseStatus, when set, is the fake router's release answer code
+	// (0 = 200). 404 plays an old router without the surface.
+	releaseStatus int
 
 	// routeAnswer answers the desk (set per test; default: no candidates).
 	routeAnswer func(w http.ResponseWriter, r *http.Request, body map[string]any)
@@ -159,6 +163,7 @@ func newFX(t *testing.T) *fx {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/direct/route", f.route)
 	mux.HandleFunc("POST /api/v1/direct/receipts", f.receipt)
+	mux.HandleFunc("POST /api/v1/direct/release", f.release)
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.fallbacks++
@@ -221,8 +226,14 @@ func (f *fx) addNode(name string, h script) nodeEP {
 }
 
 // candidate mints a signed ticket naming THIS node and answers the desk
-// with it.
+// with it (output cap 64 — the golden tests' shape).
 func (f *fx) candidate(node nodeEP, model string) func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+	return f.candidateCap(node, model, 64)
+}
+
+// candidateCap is candidate with a ticket output cap (the spare tests
+// need a cap that covers a default 4096-token ask).
+func (f *fx) candidateCap(node nodeEP, model string, maxTokens int) func(w http.ResponseWriter, r *http.Request, body map[string]any) {
 	f.t.Helper()
 	return func(w http.ResponseWriter, _ *http.Request, body map[string]any) {
 		now := time.Now()
@@ -232,7 +243,7 @@ func (f *fx) candidate(node nodeEP, model string) func(w http.ResponseWriter, r 
 			NodeID:    node.NodeID,
 			ModelID:   model,
 			ClientPub: identity.PubString(f.clientKey.Public().(ed25519.PublicKey)),
-			PriceIn:   10, PriceOut: 25, MaxTokens: 64, MaxReqs: 1,
+			PriceIn:   10, PriceOut: 25, MaxTokens: maxTokens, MaxReqs: 1,
 			NotBefore: now.Unix(), NotAfter: now.Add(clientproto.TicketLifetime).Unix(),
 		}
 		signed, err := clientproto.SignTicket(f.routerKey, f.cert, tk)
@@ -288,6 +299,62 @@ func (f *fx) receipt(w http.ResponseWriter, r *http.Request) {
 	f.receiptPosts = append(f.receiptPosts, doc)
 	f.mu.Unlock()
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// release records the release posts (phase 3 follow-up A2) and answers
+// 200, or releaseStatus when the test set it (404 = an old router).
+func (f *fx) release(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var doc map[string]any
+	if json.Unmarshal(b, &doc) != nil {
+		http.Error(w, "json", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	f.releasePosts = append(f.releasePosts, doc)
+	status := f.releaseStatus
+	f.mu.Unlock()
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status != http.StatusOK {
+		http.Error(w, "release refused", status)
+		return
+	}
+	writeJSON(w, map[string]any{"released": 0})
+}
+
+// releases waits for n release posts to land and returns them all.
+func (f *fx) releases(n int) []map[string]any {
+	f.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		got := len(f.releasePosts)
+		f.mu.Unlock()
+		if got >= n {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any{}, f.releasePosts...)
+}
+
+// releaseIDs flattens the recorded posts' ticket_ids.
+func releaseIDs(posts []map[string]any) []string {
+	var out []string
+	for _, p := range posts {
+		if ids, ok := p["ticket_ids"].([]any); ok {
+			for _, id := range ids {
+				if s, ok := id.(string); ok {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // start builds the proxy against the fake router.
@@ -1156,8 +1223,483 @@ func TestUnreachableNodeCooldown(t *testing.T) {
 	}
 	f.mu.Lock()
 	n := f.fallbacks
+	reqs := len(f.routeReqs)
+	var reported any
+	if reqs == 2 {
+		reported = f.routeReqs[1]["unreachable"]
+	}
 	f.mu.Unlock()
 	if n != 2 {
 		t.Fatalf("fallbacks = %d, want 2", n)
+	}
+	// The second route call carried the report (A1): the cooled-down node
+	// id, so the router mints no ticket for it.
+	ids, ok := reported.([]any)
+	if !ok || len(ids) != 1 || ids[0] != ep.NodeID {
+		t.Fatalf("route body unreachable = %v, want [%s]", reported, ep.NodeID)
+	}
+}
+
+// TestReleaseUnusedCandidates (phase 3 follow-up A2): the tickets a
+// request did not use are released the moment the request ends — here,
+// the busy first candidate. The used one is not released (its receipt
+// may still bill), and a request with nothing unused posts nothing.
+func TestReleaseUnusedCandidates(t *testing.T) {
+	f := newFX(t)
+	busyEP := f.addNode("busy", busyScript)
+	goodEP := f.addNode("good", goodScript)
+
+	// The first answer's ticket ids, guarded: the route answer also runs
+	// on the desk's goroutine (the background spare fetch re-runs it).
+	var idsMu sync.Mutex
+	var busyID, goodID string
+	capture := func(d map[string]any) {
+		idsMu.Lock()
+		defer idsMu.Unlock()
+		id := d["candidates"].([]any)[0].(map[string]any)["ticket"].(map[string]any)["id"].(string)
+		if busyID == "" {
+			busyID = id
+		} else if goodID == "" {
+			goodID = id
+		}
+	}
+	busyCand := f.candidate(busyEP, "test-node-side")
+	goodCand := f.candidate(goodEP, "test-node-side")
+	f.routeAnswer = func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+		rec := httptest.NewRecorder()
+		busyCand(rec, nil, nil)
+		var doc map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		rec2 := httptest.NewRecorder()
+		goodCand(rec2, nil, nil)
+		var doc2 map[string]any
+		if err := json.Unmarshal(rec2.Body.Bytes(), &doc2); err != nil {
+			t.Fatal(err)
+		}
+		capture(doc)
+		capture(doc2)
+		writeJSON(w, map[string]any{"direct": true,
+			"candidates": append(doc["candidates"].([]any), doc2["candidates"].([]any)...)})
+	}
+	firstIDs := func() (string, string) {
+		idsMu.Lock()
+		defer idsMu.Unlock()
+		return busyID, goodID
+	}
+	f.fallback = func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the second candidate must answer")
+	}
+	f.start(true)
+
+	rec := f.post(`{"model":"test-model","stream":true,"stream_options":{"include_usage":true},
+		"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	posts := f.releases(1)
+	got := releaseIDs(posts)
+	busyID, goodID = firstIDs()
+	if len(got) != 1 || got[0] != busyID {
+		t.Fatalf("released = %v, want [%s]", got, busyID)
+	}
+	if busyID == goodID {
+		t.Fatal("fixture minted the same ticket twice")
+	}
+
+	// A request that uses its only candidate releases nothing: a second
+	// model (a different spare slot — request 1's spare fetch may hold
+	// tickets this 64-cap answer cannot cover, and discarding THOSE is
+	// their own business) routes, uses its one candidate, and releases
+	// nothing anywhere.
+	f.routeAnswer = goodCand
+	if rec := f.post(`{"model":"other-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("second request status = %d", rec.Code)
+	}
+	if posts := f.releases(1); len(posts) != 1 {
+		t.Fatalf("the used candidate was released: %+v", posts)
+	}
+}
+
+// TestReleaseNotFoundOnOldRouter: a router without the release surface
+// (404) changes nothing for the request — the drop is silent.
+func TestReleaseNotFoundOnOldRouter(t *testing.T) {
+	f := newFX(t)
+	busyEP := f.addNode("busy", busyScript)
+	goodEP := f.addNode("good", goodScript)
+	// The first answer's busy ticket id, guarded: the background spare
+	// fetch re-runs the answer on the desk's goroutine.
+	var idsMu sync.Mutex
+	var busyID string
+	capture := func(d map[string]any) {
+		idsMu.Lock()
+		defer idsMu.Unlock()
+		if busyID == "" {
+			busyID = d["candidates"].([]any)[0].(map[string]any)["ticket"].(map[string]any)["id"].(string)
+		}
+	}
+	busyCand := f.candidate(busyEP, "test-node-side")
+	goodCand := f.candidate(goodEP, "test-node-side")
+	f.routeAnswer = func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+		rec := httptest.NewRecorder()
+		busyCand(rec, nil, nil)
+		var doc map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		capture(doc)
+		rec2 := httptest.NewRecorder()
+		goodCand(rec2, nil, nil)
+		var doc2 map[string]any
+		if err := json.Unmarshal(rec2.Body.Bytes(), &doc2); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(w, map[string]any{"direct": true,
+			"candidates": append(doc["candidates"].([]any), doc2["candidates"].([]any)...)})
+	}
+	f.releaseStatus = http.StatusNotFound
+	f.start(true)
+
+	rec := f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("status = %d body = %s", rec.Code, firstLine(rec.Body.String()))
+	}
+	posts := f.releases(1)
+	idsMu.Lock()
+	want := busyID
+	idsMu.Unlock()
+	if got := releaseIDs(posts); len(got) != 1 || got[0] != want {
+		t.Fatalf("released = %v, want [%s]", got, want)
+	}
+}
+
+// spareFX is the spare tests' fixture: a good node, a route desk
+// answering tickets big enough for a default ask, and a wait for the
+// background spare fetch to land. Its counters are mutex-guarded: the
+// route answer and the node script run on the desk's and the node's
+// goroutines, not the test's.
+type spareFX struct {
+	f  *fx
+	ep nodeEP
+
+	mu        sync.Mutex
+	served    int
+	mintedIDs []string // every ticket the desk minted, in order
+	busyNext  int      // refuse (busy) this many requests before serving
+}
+
+func (s *spareFX) noteServed() {
+	s.mu.Lock()
+	s.served++
+	s.mu.Unlock()
+}
+
+func (s *spareFX) servedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.served
+}
+
+func (s *spareFX) noteMinted(id string) {
+	s.mu.Lock()
+	s.mintedIDs = append(s.mintedIDs, id)
+	s.mu.Unlock()
+}
+
+func (s *spareFX) minted(i int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mintedIDs[i]
+}
+
+func newSpareFX(t *testing.T) *spareFX {
+	f := newFX(t)
+	s := &spareFX{f: f}
+	ep := f.addNode("good", func(ctx context.Context, _ wire.InferenceRequestData, emit func(wire.InferenceChunkData) error) (wire.InferenceDoneData, error) {
+		s.mu.Lock()
+		busy := s.busyNext > 0
+		if busy {
+			s.busyNext--
+		}
+		s.mu.Unlock()
+		if busy {
+			return wire.InferenceDoneData{}, wire.ErrBusy
+		}
+		s.noteServed()
+		return goodScript(ctx, wire.InferenceRequestData{}, emit)
+	})
+	s.ep = ep
+	answer := f.candidateCap(ep, "test-node-side", 8192)
+	f.routeAnswer = func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+		rec := httptest.NewRecorder()
+		answer(rec, r, body)
+		var doc map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		tk := doc["candidates"].([]any)[0].(map[string]any)["ticket"].(map[string]any)
+		s.noteMinted(tk["id"].(string))
+		// Replay the recorded bytes (the recorder already wrote them).
+		_, _ = w.Write(rec.Body.Bytes())
+	}
+	f.fallback = func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the spare tests expect the direct path to answer")
+	}
+	f.start(true)
+	return s
+}
+
+// waitSpare waits until the desk has seen the background spare fetch
+// (route call 2, spare:true) and returns the route bodies.
+func (s *spareFX) waitSpare(t *testing.T) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.f.mu.Lock()
+		reqs := append([]map[string]any{}, s.f.routeReqs...)
+		s.f.mu.Unlock()
+		if len(reqs) >= 2 && reqs[1]["spare"] == true {
+			return reqs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no spare fetch landed; route bodies = %+v", reqs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// routeCount returns how many desk calls the fixture has seen.
+func (s *spareFX) routeCount() int {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	return len(s.f.routeReqs)
+}
+
+// TestSpareServesSecondRequest (B1): after one direct request the client
+// holds a spare fetched in the background (spare:true on the desk call);
+// the second request on the same model dials straight from it — no
+// /direct/route call before it — and the next spare is fetched after.
+func TestSpareServesSecondRequest(t *testing.T) {
+	s := newSpareFX(t)
+	body := `{"model":"test-model","stream":true,"stream_options":{"include_usage":true},
+		"messages":[{"role":"user","content":"hi"}]}`
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d %s", rec.Code, rec.Body.String())
+	}
+	reqs := s.waitSpare(t)
+	if got := s.servedCount(); got != 1 {
+		t.Fatalf("node served %d times after the first request", got)
+	}
+	// The spare call reuses the finished request's shape plus spare:true.
+	if reqs[1]["model"] != reqs[0]["model"] || reqs[1]["conv_hash"] != reqs[0]["conv_hash"] {
+		t.Fatalf("spare ask drifted from the finished request: %+v vs %+v", reqs[0], reqs[1])
+	}
+
+	// The second request dials from the spare: no desk call before it.
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.servedCount(); got != 2 {
+		t.Fatalf("node served %d times, want 2 (the spare must have carried it)", got)
+	}
+	if got := s.routeCount(); got != 2 {
+		t.Fatalf("route calls = %d, want 2 (no desk call before the second dial)", got)
+	}
+	// The used spare triggers the next fetch.
+	deadline := time.Now().Add(5 * time.Second)
+	for s.routeCount() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no refetch after the used spare; calls = %d", s.routeCount())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.f.mu.Lock()
+	spare3 := s.f.routeReqs[2]["spare"] == true
+	s.f.mu.Unlock()
+	if !spare3 {
+		t.Fatal("the refetch is not a spare ask")
+	}
+}
+
+// TestSpareMismatchedMaxTokensReleased (B1): an ask past the spare's
+// ticket cap discards it (released, A2) and routes normally.
+func TestSpareMismatchedMaxTokensReleased(t *testing.T) {
+	s := newSpareFX(t)
+	if rec := s.f.post(`{"model":"test-model","max_tokens":512,"stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	reqs := s.waitSpare(t)
+	spareTicket := s.minted(1)
+
+	// The second request asks past the spare's 8192 cap: the spare is
+	// released and the desk is asked again (a normal route).
+	if rec := s.f.post(`{"model":"test-model","max_tokens":16384,"stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d", rec.Code)
+	}
+	if got := s.routeCount(); got != 3 {
+		t.Fatalf("route calls = %d, want 3 (normal route for the mismatched ask)", got)
+	}
+	s.f.mu.Lock()
+	spare2 := s.f.routeReqs[2]["spare"] == true
+	s.f.mu.Unlock()
+	if spare2 {
+		t.Fatal("the mismatched request fetched its spare before routing")
+	}
+	posts := s.f.releases(1)
+	got := releaseIDs(posts)
+	if len(got) != 1 || got[0] != spareTicket {
+		t.Fatalf("released = %v, want the spare ticket [%s]", got, spareTicket)
+	}
+	_ = reqs
+}
+
+// TestSpareTooOldReleased (B1): a spare past spareMaxAge is not used —
+// released, and the request routes normally.
+func TestSpareTooOldReleased(t *testing.T) {
+	s := newSpareFX(t)
+	if rec := s.f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	s.waitSpare(t)
+	spareTicket := s.minted(1)
+
+	// Age the spare past its use-by.
+	key := spareKeyOf(&clientproto.ChatRequest{Model: "test-model"})
+	s.f.proxy.sparesMu.Lock()
+	sp := s.f.proxy.spares[key]
+	sp.fetchedAt = time.Now().Add(-spareMaxAge - time.Second)
+	s.f.proxy.sparesMu.Unlock()
+
+	if rec := s.f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d", rec.Code)
+	}
+	if got := s.routeCount(); got != 3 {
+		t.Fatalf("route calls = %d, want 3 (the stale spare must not answer)", got)
+	}
+	posts := s.f.releases(1)
+	if got := releaseIDs(posts); len(got) != 1 || got[0] != spareTicket {
+		t.Fatalf("released = %v, want [%s]", got, spareTicket)
+	}
+}
+
+// TestSparePublicAddressChanged (B1): a spare fetched at one public
+// address is void once the machine's address changed — released, and the
+// request routes normally.
+func TestSparePublicAddressChanged(t *testing.T) {
+	s := newSpareFX(t)
+	if rec := s.f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	s.waitSpare(t)
+	spareTicket := s.minted(1)
+
+	key := spareKeyOf(&clientproto.ChatRequest{Model: "test-model"})
+	s.f.proxy.sparesMu.Lock()
+	s.f.proxy.spares[key].pub = "203.0.113.9:5555" // not this machine any more
+	s.f.proxy.sparesMu.Unlock()
+
+	if rec := s.f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d", rec.Code)
+	}
+	if got := s.routeCount(); got != 3 {
+		t.Fatalf("route calls = %d, want 3 (the voided spare must not answer)", got)
+	}
+	posts := s.f.releases(1)
+	if got := releaseIDs(posts); len(got) != 1 || got[0] != spareTicket {
+		t.Fatalf("released = %v, want [%s]", got, spareTicket)
+	}
+}
+
+// TestSpareIdleExpiryReleasesAndStops (B1): an idle client's spare is
+// released when its age passes spareMaxAge and NOT refetched — no
+// keep-alive loop holds reservations forever.
+func TestSpareIdleExpiryReleasesAndStops(t *testing.T) {
+	s := newSpareFX(t)
+	s.f.proxy.spareTTL = 40 * time.Millisecond
+
+	if rec := s.f.post(`{"model":"test-model","stream":true,
+		"messages":[{"role":"user","content":"hi"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	s.waitSpare(t) // the spare's desk call must land before we name its ticket
+	spareTicket := s.minted(1)
+	// The alarm releases the spare without any second request.
+	posts := s.f.releases(1)
+	if got := releaseIDs(posts); len(got) != 1 || got[0] != spareTicket {
+		t.Fatalf("released = %v, want [%s]", got, spareTicket)
+	}
+	key := spareKeyOf(&clientproto.ChatRequest{Model: "test-model"})
+	s.f.proxy.sparesMu.Lock()
+	held := s.f.proxy.spares[key]
+	s.f.proxy.sparesMu.Unlock()
+	if held != nil {
+		t.Fatal("the expired spare is still held")
+	}
+	// No refetch: the desk saw its two calls and nothing more.
+	time.Sleep(120 * time.Millisecond)
+	if got := s.routeCount(); got != 2 {
+		t.Fatalf("route calls = %d, want 2 (no keep-alive refetch)", got)
+	}
+}
+
+// TestSpareNeedsLiveConnection (review 3, R2): a spare is used only
+// toward a node this machine still holds a connection to — the punch its
+// offer opened may have lapsed, and a failed dial would cool the node
+// down. No connection: the spare is released and a fresh route is taken.
+func TestSpareNeedsLiveConnection(t *testing.T) {
+	s := newSpareFX(t)
+	body := `{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	s.waitSpare(t)
+	spareTicket := s.minted(1)
+	s.f.proxy.pool.Drop(s.ep.NodeID) // the pooled connection is gone
+
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.routeCount(); got < 3 {
+		t.Fatalf("route calls = %d, want a fresh route (the spare had no live connection)", got)
+	}
+	if got := releaseIDs(s.f.releases(1)); len(got) != 1 || got[0] != spareTicket {
+		t.Fatalf("released = %v, want [%s]", got, spareTicket)
+	}
+	if got := s.servedCount(); got != 2 {
+		t.Fatalf("served = %d, want 2", got)
+	}
+}
+
+// TestSpareRefusedTakesFreshRoute (review 3, R3): every spare candidate
+// refusing pre-token sends the request to a fresh route, not straight to
+// the router.
+func TestSpareRefusedTakesFreshRoute(t *testing.T) {
+	s := newSpareFX(t)
+	body := `{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("first request = %d", rec.Code)
+	}
+	s.waitSpare(t)
+	s.mu.Lock()
+	s.busyNext = 1 // the spare's dial is refused once; the fresh route's is served
+	s.mu.Unlock()
+
+	if rec := s.f.post(body); rec.Code != http.StatusOK {
+		t.Fatalf("second request = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.routeCount(); got < 3 {
+		t.Fatalf("route calls = %d, want a fresh route after the refused spare", got)
+	}
+	if got := s.servedCount(); got != 2 {
+		t.Fatalf("served = %d, want 2 (the fresh route answers, not the router)", got)
 	}
 }

@@ -92,3 +92,37 @@ func TestUnreachableReport(t *testing.T) {
 		t.Fatalf("unreachable = %v, want n1 (deduped) + n2, no expired n3", got)
 	}
 }
+
+// TestSweepKeepsStreamingConnections (field bug, 2026-11-26): an answer
+// that streamed past IdleTTL had its connection closed under it as "idle"
+// — the node logged "Application error 0x0 (remote): idle" and the UI
+// showed "the node closed the stream mid-answer" at ~60 s. A connection
+// with an open stream is never idle; its clock starts at the last Release.
+func TestSweepKeepsStreamingConnections(t *testing.T) {
+	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &quic.Transport{Conn: sock}
+	defer tr.Close()
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	p := New(tr, key)
+	defer p.Close()
+	start := time.Now()
+	p.conns["busy"] = &entry{used: start, active: 1}
+	p.conns["idle"] = &entry{used: start}
+	stale, _ := p.sweep(start.Add(IdleTTL + time.Minute))
+	if len(stale) != 1 || p.conns["busy"] == nil || p.conns["idle"] != nil {
+		t.Fatalf("sweep took %d, busy kept=%v, idle kept=%v", len(stale), p.conns["busy"] != nil, p.conns["idle"] != nil)
+	}
+	// Release starts the idle clock: right after, the connection is kept;
+	// IdleTTL later it goes.
+	p.conns["busy"].active = 0
+	p.conns["busy"].used = time.Now()
+	if stale, _ := p.sweep(time.Now()); len(stale) != 0 {
+		t.Fatal("a just-released connection was swept")
+	}
+	if stale, _ := p.sweep(time.Now().Add(IdleTTL + time.Second)); len(stale) != 1 {
+		t.Fatal("a released connection never went idle")
+	}
+}

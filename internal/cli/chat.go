@@ -77,6 +77,9 @@ func newChatCommand() *cobra.Command {
 			srv, err := proxy.New(proxy.Config{
 				Router: s.Router.Value, APIKey: s.APIKey.Value, ClientKey: clientKey,
 				NAT: natSock, Direct: direct, Version: Version,
+				// chat's stderr carries the model's thinking: the proxy's
+				// per-request lines stay out of it unless debug is asked for.
+				Log: slog.New(slog.NewTextHandler(os.Stderr, chatLogOpts(s.LogLevel.Value))),
 			})
 			if err != nil {
 				return err
@@ -132,4 +135,13 @@ func newChatCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&webSearch, "web-search", false, "ground the answer in a router-run web search")
 	cmd.Flags().StringVar(&effort, "effort", "", "reasoning effort for thinking models: off, low, medium, high (default: the model's own)")
 	return cmd
+}
+
+// chatLogOpts is chat's proxy log level: warnings only, unless the
+// resolved log level is debug.
+func chatLogOpts(level string) *slog.HandlerOptions {
+	if level == "debug" {
+		return &slog.HandlerOptions{Level: slog.LevelDebug}
+	}
+	return &slog.HandlerOptions{Level: slog.LevelWarn}
 }

@@ -36,6 +36,10 @@ type entry struct {
 	conn *quic.Conn
 	pub  string
 	used time.Time
+	// active counts the streams open on the connection right now (Acquire
+	// / Release). The janitor never closes a connection with one: an
+	// answer that streams past IdleTTL is in use, not idle.
+	active int
 }
 
 // Pool is the connection cache.
@@ -157,6 +161,32 @@ func (p *Pool) ForgetFailures() {
 	p.mu.Unlock()
 }
 
+// Acquire marks one stream open on the node's pooled connection (after a
+// successful Get + OpenStream); Release ends it. A connection with an open
+// stream is never closed as idle, and its idle clock starts when its last
+// stream ends.
+func (p *Pool) Acquire(nodeID string, c *quic.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.conns[nodeID]; e != nil && e.conn == c {
+		e.active++
+		e.used = time.Now()
+	}
+}
+
+// Release ends a stream Acquire started on that connection (a connection
+// replaced meanwhile keeps its own count).
+func (p *Pool) Release(nodeID string, c *quic.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.conns[nodeID]; e != nil && e.conn == c {
+		if e.active > 0 {
+			e.active--
+		}
+		e.used = time.Now()
+	}
+}
+
 // Drop forgets a connection that failed at the stream level (the node
 // went away while the pool held it): the next Get dials fresh.
 func (p *Pool) Drop(nodeID string) {
@@ -180,28 +210,37 @@ func (p *Pool) janitor() {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 	for now := range t.C {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
+		stale, closed := p.sweep(now)
+		if closed {
 			return
 		}
-		for k, until := range p.failed {
-			if now.After(until) {
-				delete(p.failed, k)
-			}
-		}
-		var stale []*entry
-		for id, e := range p.conns {
-			if now.Sub(e.used) > IdleTTL {
-				stale = append(stale, e)
-				delete(p.conns, id)
-			}
-		}
-		p.mu.Unlock()
 		for _, e := range stale {
 			_ = e.conn.CloseWithError(0, "idle")
 		}
 	}
+}
+
+// sweep forgets expired cooldowns and takes out the idle connections —
+// unused for IdleTTL with no stream open — returning them for the caller
+// to close. closed reports a pool that was shut down.
+func (p *Pool) sweep(now time.Time) (stale []*entry, closed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, true
+	}
+	for k, until := range p.failed {
+		if now.After(until) {
+			delete(p.failed, k)
+		}
+	}
+	for id, e := range p.conns {
+		if e.active == 0 && now.Sub(e.used) > IdleTTL {
+			stale = append(stale, e)
+			delete(p.conns, id)
+		}
+	}
+	return stale, false
 }
 
 // Close shuts every pooled connection down.

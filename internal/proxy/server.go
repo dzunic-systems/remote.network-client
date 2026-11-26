@@ -722,7 +722,7 @@ func (s *Server) stall() time.Duration {
 // turn (and the eventual fallback).
 func (s *Server) tryCandidate(w http.ResponseWriter, r *http.Request, req *clientproto.ChatRequest, cand routeCandidate) outcome {
 	start := time.Now()
-	_, stream, ok := s.openStream(r, cand)
+	qc, stream, ok := s.openStream(r, cand)
 	if !ok {
 		return outcomeRefused
 	}
@@ -733,6 +733,7 @@ func (s *Server) tryCandidate(w http.ResponseWriter, r *http.Request, req *clien
 	defer func() {
 		stream.CancelRead(0)
 		_ = stream.Close()
+		s.pool.Release(cand.NodeID, qc) // the connection's idle clock starts now
 	}()
 	// The consumer walking away must unblock the read: force the stream's
 	// deadline. (QUIC reads do not watch the request context.)
@@ -877,6 +878,7 @@ func (s *Server) openStream(r *http.Request, cand routeCandidate) (*quic.Conn, *
 		}
 		st, err := c.OpenStreamSync(r.Context())
 		if err == nil {
+			s.pool.Acquire(cand.NodeID, c) // the caller Releases when the stream ends
 			return c, st, true
 		}
 		s.pool.Drop(cand.NodeID)

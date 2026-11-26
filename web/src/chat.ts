@@ -59,6 +59,16 @@ let abort: AbortController | null = null
 const cache = new Map<string, ChatMessage[]>()
 
 const MAX_TURNS = 40 // keep the request history bounded (storage keeps more)
+
+// UI_NOTES are what the page writes into an assistant turn that produced no
+// answer. They are notes for the reader, never model output: the history a
+// turn sends must not carry them (a model reading "(stopped before the first
+// token)" as its own words talks about an error that never happened to it).
+const NOTE_LENGTH = '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
+const NOTE_NO_ANSWER = '(the model thought but wrote no answer — send "continue" to have it answer)'
+const NOTE_STOPPED = '(stopped before the first token)'
+const NOTE_EMPTY = '(empty response)'
+const UI_NOTES = new Set([NOTE_LENGTH, NOTE_NO_ANSWER, NOTE_STOPPED, NOTE_EMPTY])
 const STREAM_SAVE_MS = 2000 // a closed tab keeps most of a long answer
 
 function meta(id: string): ChatMeta | undefined {
@@ -329,7 +339,7 @@ export async function sendChat(text: string, images: string[] = []) {
       ]
     }
     const history = msgs
-      .filter((m) => !m.error && (m.text || m.images?.length || m.role === 'user'))
+      .filter((m) => !m.error && !(m.role === 'assistant' && UI_NOTES.has(m.text)) && (m.text || m.images?.length || m.role === 'user'))
       .map((m) => ({ role: m.role, content: m.role === 'assistant' ? m.text || '(empty)' : parts(m) }))
       .slice(-MAX_TURNS)
 
@@ -362,8 +372,8 @@ export async function sendChat(text: string, images: string[] = []) {
       if (!shell.text && !shell.reasoning && finish && finish !== 'tool_calls') {
         shell.text =
           finish === 'length'
-            ? '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
-            : '(the model thought but wrote no answer — send "continue" to have it answer)'
+            ? NOTE_LENGTH
+            : NOTE_NO_ANSWER
       }
     } else {
       const resp = await plainChatBody(model, history)
@@ -375,7 +385,7 @@ export async function sendChat(text: string, images: string[] = []) {
   } catch (e) {
     const err = e as Error
     if (err.name === 'AbortError') {
-      if (!shell.text && !shell.reasoning) shell.text = '(stopped before the first token)'
+      if (!shell.text && !shell.reasoning) shell.text = NOTE_STOPPED
     } else {
       const msg = String(err?.message ?? e).replace(/^Error: /, '')
       if (state.activeId === chatId) state.error = msg
@@ -435,8 +445,8 @@ function applyPlainEnding(shell: ChatMessage, finish: string | null) {
   if (!shell.text && !shell.reasoning && finish) {
     shell.text =
       finish === 'length'
-        ? '(the model ran out of output tokens while still thinking — no answer was written; send "continue" to have it finish)'
-        : '(the model thought but wrote no answer — send "continue" to have it answer)'
+        ? NOTE_LENGTH
+        : NOTE_NO_ANSWER
   }
 }
 
@@ -509,7 +519,7 @@ async function readPlainStream(resp: Response, shell: ChatMessage, chatId: strin
     }
   }
   if (usage && !shell.text && !shell.reasoning) {
-    shell.text = '(empty response)'
+    shell.text = NOTE_EMPTY
   }
   return finish
 }

@@ -749,9 +749,11 @@ func (s *Server) tryCandidate(w http.ResponseWriter, r *http.Request, req *clien
 
 	reqID := newRequestID()
 	inference := req.ToInference(cand.Ticket.ModelID)
-	// The node clamps MaxTokens to the ticket's cap; never send a bigger
-	// ask than the ticket allows.
-	if cand.Ticket.MaxTokens > 0 && (inference.MaxTokens <= 0 || inference.MaxTokens > cand.Ticket.MaxTokens) {
+	// The ticket's cap is a billing ceiling the node keeps itself; it is
+	// never the ask. No ask stays no ask (the backend's default, as on the
+	// relay path) — filling it with the cap handed the backend the card's
+	// whole window, and a backend refused that with an empty answer.
+	if cand.Ticket.MaxTokens > 0 && inference.MaxTokens > cand.Ticket.MaxTokens {
 		inference.MaxTokens = cand.Ticket.MaxTokens
 	}
 	if err := clientproto.SendDirectRequest(stream, clientproto.DirectRequestData{
